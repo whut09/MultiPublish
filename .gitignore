@@ -1,0 +1,13 @@
+﻿node_modules/
+dist/
+dist-electron/
+release/
+.codex-tmp/
+coverage/
+*.log
+*.exe
+*.exe.blockmap
+.env
+.env.*
+.DS_Store
+Thumbs.db
