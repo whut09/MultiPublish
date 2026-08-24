@@ -1,6 +1,6 @@
 {
     "name": "multipublish",
-    "version": "0.1.2",
+    "version": "0.1.3",
     "description": "自媒体、短视频多平台一键发布平台",
     "main": "dist-electron/main/index.js",
     "author": "whut09",
@@ -10,7 +10,7 @@
         "dev": "electron-vite dev",
         "build": "electron-vite build",
         "typecheck": "tsc --noEmit",
-        "test": "node --experimental-strip-types --test src/main/persistent-store.test.mjs",
+        "test": "node --experimental-strip-types --test src/main/persistent-store.test.mjs src/main/ffmpeg.test.ts",
         "dist": "npm run build && electron-builder --win nsis"
     },
     "dependencies": {

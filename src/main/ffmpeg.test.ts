@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import test from 'node:test';
-import {ffmpegCandidates,resolveFfmpegBinary} from './ffmpeg';
+import {ffmpegCandidates,resolveFfmpegBinary} from './ffmpeg.ts';
 
 test('packaged Windows app resolves the single external ffmpeg resource first',()=>{
   const resourcesPath=path.join('D:','Program Files','MultiPublish','resources');
