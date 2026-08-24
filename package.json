@@ -1,6 +1,6 @@
 {
     "name": "multipublish",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "description": "自媒体、短视频多平台一键发布平台",
     "main": "dist-electron/main/index.js",
     "author": "whut09",
@@ -42,8 +42,21 @@
         "files": [
             "dist/**/*",
             "dist-electron/**/*",
-            "package.json"
+            "package.json",
+            "!node_modules/ffmpeg-static/ffmpeg.exe",
+            "!node_modules/ffmpeg-static/ffmpeg.exe.*"
         ],
+        "extraResources": [
+            {
+                "from": "node_modules/ffmpeg-static/ffmpeg.exe",
+                "to": "ffmpeg/ffmpeg.exe"
+            }
+        ],
+        "electronLanguages": [
+            "zh-CN",
+            "en-US"
+        ],
+        "compression": "maximum",
         "win": {
             "target": [
                 "nsis"
@@ -54,9 +67,7 @@
             "oneClick": false,
             "allowToChangeInstallationDirectory": true
         },
-        "asarUnpack": [
-            "node_modules/ffmpeg-static/**"
-        ]
+        "removePackageScripts": true
     },
     "repository": {
         "type": "git",

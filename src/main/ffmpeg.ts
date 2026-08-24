@@ -20,6 +20,7 @@ export function ffmpegCandidates(options: FfmpegResolveOptions = {}) {
   const executable = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
   const candidates = [
     options.envPath,
+    resourcesPath ? path.join(resourcesPath, 'ffmpeg', executable) : undefined,
     resourcesPath ? path.join(resourcesPath, 'app.asar.unpacked', 'node_modules', 'ffmpeg-static', executable) : undefined,
     resourcesPath ? path.join(resourcesPath, 'node_modules', 'ffmpeg-static', executable) : undefined,
     options.appPath ? path.join(unpacked(options.appPath), 'node_modules', 'ffmpeg-static', executable) : undefined,

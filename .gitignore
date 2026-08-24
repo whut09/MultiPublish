@@ -5,6 +5,7 @@ release/
 .codex-tmp/
 .runtime-logs/
 coverage/
+cover-test/
 *.log
 *.exe
 *.exe.blockmap
