@@ -10,6 +10,7 @@
                     "dev":  "electron-vite dev",
                     "build":  "electron-vite build",
                     "typecheck":  "tsc --noEmit",
+                    "test":  "node --experimental-strip-types --test src/main/persistent-store.test.mjs",
                     "dist":  "npm run build \u0026\u0026 electron-builder --win nsis"
                 },
     "dependencies":  {
