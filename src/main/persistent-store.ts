@@ -86,11 +86,14 @@ export class PersistentJsonStore<T> {
   async update(fn: (data: T) => void) {
     let snapshot: T | undefined;
     const operation = this.updateQueue.then(async () => {
+      const before = JSON.stringify(this.data);
       const next = structuredClone(this.data);
       fn(next);
       this.options.parse(next);
-      this.data = next;
-      await this.save();
+      if (JSON.stringify(next) !== before) {
+        this.data = next;
+        await this.save();
+      }
       snapshot = this.get();
     });
     this.updateQueue = operation.catch(() => undefined);

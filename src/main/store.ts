@@ -8,6 +8,10 @@ const statuses = new Set(['checking', 'logged_in', 'logged_out']);
 const taskStatuses = new Set(['pending', 'opening', 'uploading', 'publishing', 'manual_required', 'success', 'failed']);
 const isRecord = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === 'object' && !Array.isArray(value));
 const isString = (value: unknown): value is string => typeof value === 'string';
+const stringArray = (value: unknown, name: string) => {
+  if (!Array.isArray(value) || value.some(item => !isString(item))) throw new Error(`${name}数据结构无效`);
+  return value as string[];
+};
 const records = (value: unknown, name: string) => {
   if (!Array.isArray(value) || value.some(item => !isRecord(item))) throw new Error(`${name}数据结构无效`);
   return value as Record<string, unknown>[];
@@ -30,17 +34,17 @@ function parseAppData(value: unknown): AppData {
   }) as Account[];
   const drafts = records(value.drafts, '草稿').map(draft => {
     if (!isString(draft.id) || (draft.type !== 'video' && draft.type !== 'image_text') || !isString(draft.title) || !Array.isArray(draft.mediaPaths) || !Array.isArray(draft.accountIds)) throw new Error('草稿记录无效');
-    const mediaPaths = draft.mediaPaths as unknown[];
-    const accountIds = draft.accountIds as unknown[];
+    const mediaPaths = stringArray(draft.mediaPaths, '视频路径');
+    const accountIds = stringArray(draft.accountIds, '账号引用');
     return ({
     ...draft,
     id: draft.id as string,
     type: draft.type as PublishDraft['type'],
     title: draft.title as string,
     description: isString(draft.description) ? draft.description : '',
-    topics: Array.isArray(draft.topics) ? draft.topics.filter(isString) : [],
-    mediaPaths: mediaPaths.filter(isString),
-    accountIds: accountIds.filter(isString),
+    topics: draft.topics === undefined ? [] : stringArray(draft.topics, '话题标签'),
+    mediaPaths,
+    accountIds,
     createdAt: isString(draft.createdAt) ? draft.createdAt : new Date(0).toISOString(),
     });
   }) as PublishDraft[];
