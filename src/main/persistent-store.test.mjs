@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import {PersistentJsonStore} from './persistent-store.ts';
 
-const empty = {accounts: [], drafts: []};
+const empty = {accounts: [], drafts: [], accountSelections: {}};
 const parse = value => {
   if (!value || typeof value !== 'object' || !Array.isArray(value.accounts) || !Array.isArray(value.drafts)) {
     throw new Error('invalid fixture');
@@ -25,7 +25,7 @@ test('keeps the previous valid snapshot when the primary file is corrupted', asy
   const recovered = makeStore(directory);
   const status = await recovered.load();
   assert.equal(status.source, 'backup');
-  assert.deepEqual(recovered.get(), {accounts: ['first'], drafts: []});
+  assert.deepEqual(recovered.get(), {accounts: ['first'], drafts: [], accountSelections: {}});
   const quarantined = (await fs.readdir(directory)).filter(name => name.includes('.corrupt-'));
   assert.equal(quarantined.length, 1);
 });
@@ -57,4 +57,20 @@ test('does not retain mutations from a failed update callback', async () => {
     throw new Error('intentional failure');
   }));
   assert.deepEqual(store.get(), empty);
+});
+
+test('persists the last selected accounts for each publish type', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'multipublish-store-'));
+  const store = makeStore(directory);
+  await store.load();
+  await store.update(data => {
+    data.accountSelections.video = ['account-video'];
+    data.accountSelections.image_text = ['account-image'];
+  });
+  const reloaded = makeStore(directory);
+  await reloaded.load();
+  assert.deepEqual(reloaded.get().accountSelections, {
+    video: ['account-video'],
+    image_text: ['account-image'],
+  });
 });
