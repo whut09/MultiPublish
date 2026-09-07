@@ -234,9 +234,18 @@ async function runInspectSelfTest() {
     path.join(app.getPath("temp"), "multipublish-inspect-self-test.json");
   const data = store.get();
   const account = data.accounts.find((item) => item.platform === platform);
-  const draft = data.drafts.find((item) =>
-    item.accountIds.includes(account?.id || ""),
-  );
+  const lastSuccessfulTask = account
+    ? data.tasks.find(
+        (item) =>
+          item.accountId === account.id &&
+          item.status === "success" &&
+          item.title.trim(),
+      )
+    : undefined;
+  const draft =
+    (lastSuccessfulTask &&
+      data.drafts.find((item) => item.id === lastSuccessfulTask.draftId)) ||
+    data.drafts.find((item) => item.accountIds.includes(account?.id || ""));
   let inspectWindow: BrowserWindow | undefined;
   try {
     if (!account) throw new Error("找不到平台账号：" + platform);
@@ -257,7 +266,7 @@ async function runInspectSelfTest() {
     const wc = inspectWindow.webContents;
     const inspectUrl =
       account.platform === "bilibili"
-        ? "https://member.bilibili.com/platform/manager/article"
+        ? "https://member.bilibili.com/platform/upload-manager/article"
         : account.platform === "douyin"
           ? "https://creator.douyin.com/creator-micro/content/manage"
           : platformMap[account.platform].homeUrl;
@@ -271,12 +280,6 @@ async function runInspectSelfTest() {
       );
       await new Promise((resolve) => setTimeout(resolve, 7000));
     }
-    if (account.platform === "bilibili") {
-      await wc.executeJavaScript(
-        "(()=>{const visible=e=>!!e&&e.offsetParent!==null;const nodes=[...document.querySelectorAll('a,button,[role=button],div,span')].filter(e=>visible(e)&&(e.textContent||'').trim()==='\u5185\u5bb9\u7ba1\u7406');nodes.sort((a,b)=>(a.getBoundingClientRect().width*a.getBoundingClientRect().height)-(b.getBoundingClientRect().width*b.getBoundingClientRect().height));const label=nodes[0];if(!label)return false;(label.closest('a,button,[role=button]')||label).click();return true})()",
-      );
-      await new Promise((resolve) => setTimeout(resolve, 7000));
-    }
     const artifactDir = path.join(app.getPath("userData"), "task-artifacts");
     await fs.mkdir(artifactDir, { recursive: true });
     const screenshotPath = path.join(
@@ -285,23 +288,43 @@ async function runInspectSelfTest() {
     );
     await fs.writeFile(screenshotPath, (await wc.capturePage()).toPNG());
     const snapshot = await wc.executeJavaScript(
-      "(()=>({url:location.href,title:document.title,text:(document.body?.innerText||'').slice(0,30000)}))()",
+      "(()=>{const text=(document.body?.innerText||'').slice(0,30000);return{url:location.href,title:document.title,text,login:/扫码登录|手机号登录|验证码登录|短信登录|密码登录|立即登录/.test(text)||location.pathname.includes('/login')||location.pathname.includes('/auth')}})()",
     );
-    const expectedTitle = draft
-      ? Array.from(draft.title).slice(0, 20).join("")
-      : "";
+    const expectedTitle =
+      process.env.MULTIPUBLISH_INSPECT_SELF_TEST_TITLE?.trim() ||
+      lastSuccessfulTask?.title ||
+      draft?.title ||
+      "";
+    const candidates = [
+      expectedTitle,
+      Array.from(expectedTitle).slice(0, 30).join(""),
+      Array.from(expectedTitle).slice(0, 20).join(""),
+      Array.from(expectedTitle).slice(0, 16).join(""),
+      Array.from(expectedTitle).slice(0, 12).join(""),
+    ].filter((value) => value.length >= 8);
+    const normalize = (value: string) =>
+      value
+        .normalize("NFKC")
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}]+/gu, "");
+    const normalizedText = normalize(snapshot.text);
+    const foundTitle = candidates.some(
+      (value) =>
+        snapshot.text.includes(value) ||
+        normalizedText.includes(normalize(value)),
+    );
+    const ok = !snapshot.login && foundTitle;
     await fs.writeFile(
       reportPath,
       JSON.stringify(
         {
-          ok: true,
+          ok,
           platform,
           url: snapshot.url,
           pageTitle: snapshot.title,
           expectedTitle,
-          foundTitle: Boolean(
-            expectedTitle && snapshot.text.includes(expectedTitle),
-          ),
+          foundTitle,
+          login: snapshot.login,
           text: snapshot.text,
           screenshotPath,
           createdAt: new Date().toISOString(),
@@ -311,7 +334,7 @@ async function runInspectSelfTest() {
       ),
       "utf8",
     );
-    app.exit(0);
+    app.exit(ok ? 0 : 2);
   } catch (error) {
     await fs
       .writeFile(

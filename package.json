@@ -1,6 +1,6 @@
 {
     "name": "multipublish",
-    "version": "0.1.4",
+    "version": "0.1.5",
     "description": "自媒体、短视频多平台一键发布平台",
     "main": "dist-electron/main/index.js",
     "author": "whut09",
