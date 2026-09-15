@@ -3,6 +3,7 @@ dist/
 dist-electron/
 release/
 release-v*/
+release-*/
 .codex-tmp/
 .runtime-logs/
 coverage/
