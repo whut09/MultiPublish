@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import ffmpegStatic from "ffmpeg-static";
 import { resolveFfmpegBinary } from "./ffmpeg";
 import { JsonStore } from "./store";
-import { BrowserManager } from "./browser-manager";
+import { BrowserManager, chromeUserAgent } from "./browser-manager";
 import { attachWindowDiagnostics } from "./runtime-guard";
 import { platformMap } from "../shared/platforms";
 import type {
@@ -21,6 +21,7 @@ if (process.env.MULTIPUBLISH_USER_DATA_DIR)
   app.setPath("userData", process.env.MULTIPUBLISH_USER_DATA_DIR);
 let win: BrowserWindow | null = null;
 let browsers: BrowserManager | null = null;
+let quittingAfterSessionFlush = false;
 const store = new JsonStore();
 const execFileAsync = promisify(execFile);
 let verifiedFfmpegBinary: string | undefined;
@@ -264,11 +265,14 @@ async function runInspectSelfTest() {
       },
     });
     const wc = inspectWindow.webContents;
+    wc.setUserAgent(chromeUserAgent);
     const inspectUrl =
       account.platform === "bilibili"
         ? "https://member.bilibili.com/platform/upload-manager/article"
         : account.platform === "douyin"
           ? "https://creator.douyin.com/creator-micro/content/manage"
+          : account.platform === "weixin"
+            ? "https://channels.weixin.qq.com/platform/post/list"
           : platformMap[account.platform].homeUrl;
     await wc.loadURL(inspectUrl).catch((error) => {
       if (!/ERR_ABORTED/.test(String(error))) throw error;
@@ -290,30 +294,49 @@ async function runInspectSelfTest() {
     const snapshot = await wc.executeJavaScript(
       "(()=>{const text=(document.body?.innerText||'').slice(0,30000);return{url:location.href,title:document.title,text,login:/扫码登录|手机号登录|验证码登录|短信登录|密码登录|立即登录/.test(text)||location.pathname.includes('/login')||location.pathname.includes('/auth')}})()",
     );
+    const frameSnapshots = (await Promise.all(
+      wc.mainFrame.framesInSubtree.map((frame) =>
+        frame
+          .executeJavaScript(
+            "(()=>{const text=(document.body?.innerText||'').slice(0,30000);return{url:location.href,text,login:/扫码登录|手机号登录|验证码登录|短信登录|密码登录|立即登录/.test(text)||location.pathname.includes('/login')||location.pathname.includes('/auth')}})()",
+          )
+          .catch(() => ({ url: "", text: "", login: false })),
+      ),
+    )) as Array<{ url: string; text: string; login: boolean }>;
+    const combinedText = [
+      snapshot.text,
+      ...frameSnapshots.map((frame) => frame.text),
+    ].join("\n");
     const expectedTitle =
       process.env.MULTIPUBLISH_INSPECT_SELF_TEST_TITLE?.trim() ||
       lastSuccessfulTask?.title ||
       draft?.title ||
       "";
-    const candidates = [
-      expectedTitle,
-      Array.from(expectedTitle).slice(0, 30).join(""),
-      Array.from(expectedTitle).slice(0, 20).join(""),
-      Array.from(expectedTitle).slice(0, 16).join(""),
-      Array.from(expectedTitle).slice(0, 12).join(""),
-    ].filter((value) => value.length >= 8);
+    const candidates =
+      account.platform === "weixin"
+        ? [expectedTitle]
+        : [
+            expectedTitle,
+            Array.from(expectedTitle).slice(0, 30).join(""),
+            Array.from(expectedTitle).slice(0, 20).join(""),
+            Array.from(expectedTitle).slice(0, 16).join(""),
+            Array.from(expectedTitle).slice(0, 12).join(""),
+          ].filter((value) => value.length >= 8);
     const normalize = (value: string) =>
       value
         .normalize("NFKC")
         .toLowerCase()
         .replace(/[^\p{L}\p{N}]+/gu, "");
-    const normalizedText = normalize(snapshot.text);
+    const normalizedText = normalize(combinedText);
     const foundTitle = candidates.some(
       (value) =>
-        snapshot.text.includes(value) ||
+        combinedText.includes(value) ||
         normalizedText.includes(normalize(value)),
     );
-    const ok = !snapshot.login && foundTitle;
+    const ok =
+      !snapshot.login &&
+      !frameSnapshots.some((frame) => frame.login) &&
+      foundTitle;
     await fs.writeFile(
       reportPath,
       JSON.stringify(
@@ -325,7 +348,7 @@ async function runInspectSelfTest() {
           expectedTitle,
           foundTitle,
           login: snapshot.login,
-          text: snapshot.text,
+          text: combinedText,
           screenshotPath,
           createdAt: new Date().toISOString(),
         },
@@ -391,8 +414,12 @@ async function createWindow() {
     await win.loadURL(process.env.ELECTRON_RENDERER_URL);
   else await win.loadFile(path.join(dir, "../../dist/index.html"));
   win.on("closed", () => {
-    browsers?.destroy();
-    browsers = null;
+    // Windows exits after its last window closes. Keep the browser manager alive
+    // until before-quit so its persistent login partitions can finish flushing.
+    if (process.platform === "darwin") {
+      void browsers?.destroy();
+      browsers = null;
+    }
     win = null;
   });
 }
@@ -422,8 +449,8 @@ function ipc() {
       });
     }),
   );
-  ipcMain.handle("account:remove", (_e, id: string) => {
-    browsers?.remove(id);
+  ipcMain.handle("account:remove", async (_e, id: string) => {
+    await browsers?.remove(id);
     return store.update((d) => {
       d.accounts = d.accounts.filter((x) => x.id !== id);
       d.tasks = d.tasks.filter((x) => x.accountId !== id);
@@ -618,6 +645,15 @@ app.whenReady().then(async () => {
 });
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
+});
+app.on("before-quit", (event) => {
+  if (quittingAfterSessionFlush || !browsers) return;
+  event.preventDefault();
+  quittingAfterSessionFlush = true;
+  void browsers.destroy().finally(() => {
+    browsers = null;
+    app.quit();
+  });
 });
 ipcMain.handle(
   "account:selection",

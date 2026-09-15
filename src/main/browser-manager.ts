@@ -12,33 +12,142 @@ import { platformMap } from "../shared/platforms";
 type AccountUpdate = { name?: string; loginStatus?: LoginStatus };
 type PublishProgress = (status: TaskStatus, message: string) => Promise<void>;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const writeBrowserLog = async (message: string) => {
+  const line = `[${new Date().toISOString()}] ${message}\n`;
+  await fs
+    .appendFile(
+      path.join(app.getPath("logs"), "multipublish-browser.log"),
+      line,
+    )
+    .catch(() => undefined);
+};
+const redactWeixinDiagnostic = (value: unknown, limit = 16000) =>
+  String(value ?? "")
+    .replace(
+      /((?:cookie|sessionid|token|findertoken|encfilekey)["']?\s*[:=]\s*["']?)[^"'&\s,}]+/gi,
+      "$1[redacted]",
+    )
+    .replace(/([?&](?:token|findertoken|encfilekey)=)[^&\s]+/gi, "$1[redacted]")
+    .slice(0, limit);
+export const chromeUserAgent =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+const weixinPostListRecorder = `(()=>{try{if(window.__multipublishPostListRecorder)return true;window.__multipublishPostListRecorder=true;window.__multipublishPostListEvidence=[];const record=(url,body)=>{if(!/\\/post\\/post_list(?:\\?|$)/.test(String(url||""))||typeof body!=="string")return;try{const parsed=JSON.parse(body);const list=parsed?.data?.list;if(!Array.isArray(list))return;const titles=list.map(item=>({objectId:String(item?.objectId||"").slice(0,120),createTime:item?.createTime,titles:[item?.desc?.description,item?.desc?.mpTitle,item?.description,item?.title,...(Array.isArray(item?.desc?.shortTitle)?item.desc.shortTitle.map(value=>typeof value==="string"?value:value?.shortTitle):[])].filter(value=>typeof value==="string"&&value.trim())}));window.__multipublishPostListEvidence.push({url:String(url),titles});if(window.__multipublishPostListEvidence.length>4)window.__multipublishPostListEvidence.shift()}catch(_){}};const fetch0=window.fetch;if(typeof fetch0==="function")window.fetch=function(input,init){const url=typeof input==="string"?input:input?.url||"";return fetch0.call(this,input,init).then(response=>{if(/\\/post\\/post_list(?:\\?|$)/.test(String(url)))response.clone().text().then(body=>record(url,body)).catch(()=>{});return response})};const open0=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(method,url){this.__multipublishPostListUrl=String(url||"");return open0.apply(this,arguments)};const send0=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.send=function(body){if(/\\/post\\/post_list(?:\\?|$)/.test(this.__multipublishPostListUrl||""))this.addEventListener("load",()=>{try{record(this.__multipublishPostListUrl,this.responseText)}catch(_){}});return send0.call(this,body)};return true}catch(_){return false}})()`;
+const extractWeixinPostListTitles = (body: string) => {
+  try {
+    const list = JSON.parse(body)?.data?.list;
+    if (!Array.isArray(list)) return [] as string[];
+    return list.flatMap((item: any) =>
+      [
+        item?.desc?.description,
+        item?.desc?.mpTitle,
+        item?.description,
+        item?.title,
+        ...(Array.isArray(item?.desc?.shortTitle)
+          ? item.desc.shortTitle.map((value: any) =>
+              typeof value === "string" ? value : value?.shortTitle,
+            )
+          : []),
+      ].filter(
+        (value): value is string =>
+          typeof value === "string" && Boolean(value.trim()),
+      ),
+    );
+  } catch {
+    return [] as string[];
+  }
+};
 export class BrowserManager {
   private views = new Map<string, WebContentsView>();
+  private inspectTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private inspectVersions = new Map<string, number>();
+  private sessionFlushes = new Map<string, Promise<void>>();
+  private weixinRemoteUploadAt = new Map<number, number>();
+  private weixinPublishPoints = new Map<number, { x: number; y: number }>();
+  private weixinPostCreateResults = new Map<
+    number,
+    { ok: boolean; errCode?: number; body: string }
+  >();
+  private weixinPostListTitles = new Map<number, string[]>();
   private active?: string;
   private bounds: BrowserBounds = { x: 280, y: 160, width: 900, height: 650 };
   constructor(
     private win: BrowserWindow,
     private updateAccount: (id: string, update: AccountUpdate) => Promise<void>,
   ) {}
+  private accountSession(accountId: string) {
+    return session.fromPartition("persist:account-" + accountId);
+  }
+  private async flushAccountSession(accountId: string, reason: string) {
+    const existing = this.sessionFlushes.get(accountId);
+    if (existing) return existing;
+    const profile = this.accountSession(accountId);
+    const flush = Promise.all([
+      profile.cookies.flushStore(),
+      profile.flushStorageData(),
+    ])
+      .then(() =>
+        writeBrowserLog(
+          `session-flushed account=${accountId} reason=${reason}`,
+        ),
+      )
+      .catch(async (error) => {
+        await writeBrowserLog(
+          `session-flush-failed account=${accountId} reason=${reason} error=${String(error)}`,
+        );
+      })
+      .finally(() => this.sessionFlushes.delete(accountId));
+    this.sessionFlushes.set(accountId, flush);
+    return flush;
+  }
   private ensureView(account: Account) {
     let view = this.views.get(account.id);
     if (view) return view;
     view = new WebContentsView({
       webPreferences: {
-        session: session.fromPartition("persist:account-" + account.id),
+        session: this.accountSession(account.id),
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
       },
     });
+    view.webContents.setUserAgent(chromeUserAgent);
+    void writeBrowserLog(
+      `create account=${account.id} platform=${account.platform} url=${view.webContents.getURL()}`,
+    );
     view.webContents.setWindowOpenHandler(({ url }) => {
+      void writeBrowserLog(`window-open account=${account.id} url=${url}`);
+      if (account.platform === "weixin")
+        return {
+          action: "allow",
+          overrideBrowserWindowOptions: {
+            show: true,
+            width: 900,
+            height: 700,
+            autoHideMenuBar: true,
+            webPreferences: {
+              session: this.accountSession(account.id),
+              nodeIntegration: false,
+              contextIsolation: true,
+              sandbox: true,
+              backgroundThrottling: false,
+            },
+          },
+        };
       if (url.startsWith("http")) view?.webContents.loadURL(url);
       else shell.openExternal(url);
       return { action: "deny" };
     });
-    const inspect = () => this.inspectAccount(account, view!);
+    const inspect = () => {
+      void writeBrowserLog(
+        `navigation account=${account.id} url=${view!.webContents.getURL()}`,
+      );
+      this.scheduleInspect(account, view!);
+    };
     view.webContents.on("did-finish-load", inspect);
     view.webContents.on("did-navigate", inspect);
+    view.webContents.on("did-frame-navigate", inspect);
+    view.webContents.on("did-redirect-navigation", inspect);
+    view.webContents.on("did-navigate-in-page", inspect);
     view.webContents.on("page-title-updated", inspect);
     this.views.set(account.id, view);
     return view;
@@ -54,12 +163,28 @@ export class BrowserManager {
     this.active = account.id;
     view.setBounds(this.bounds);
     const p = platformMap[account.platform];
+    void writeBrowserLog(
+      `show account=${account.id} target=${target} current=${view.webContents.getURL()}`,
+    );
     if (!view.webContents.getURL() || target === "publish")
       await view.webContents.loadURL(
         target === "publish" ? p.publishUrl : p.homeUrl,
       );
+    await this.updateAccount(account.id, { loginStatus: "checking" });
     await sleep(1000);
     await this.inspectAccount(account, view);
+  }
+
+  private scheduleInspect(account: Account, view: WebContentsView) {
+    const previous = this.inspectTimers.get(account.id);
+    if (previous) clearTimeout(previous);
+    const version = (this.inspectVersions.get(account.id) || 0) + 1;
+    this.inspectVersions.set(account.id, version);
+    const timer = setTimeout(() => {
+      this.inspectTimers.delete(account.id);
+      void this.inspectAccount(account, view, version);
+    }, 1400);
+    this.inspectTimers.set(account.id, timer);
   }
   async autoPublish(
     account: Account,
@@ -75,30 +200,255 @@ export class BrowserManager {
         status: "failed" as const,
         message: "视频文件不存在或为空：" + videoPath,
       };
+    const requiresVisibleWindow = account.platform === "weixin";
     const automationWindow = new BrowserWindow({
-      show: false,
-      skipTaskbar: true,
+      show: true,
+      skipTaskbar: !requiresVisibleWindow,
+      autoHideMenuBar: true,
+      title: requiresVisibleWindow ? "MultiPublish - 视频号发布" : "MultiPublish",
+      ...(requiresVisibleWindow ? {} : { x: -10000, y: -10000 }),
       width: 1280,
       height: 900,
       webPreferences: {
-        session: session.fromPartition("persist:account-" + account.id),
+        session: this.accountSession(account.id),
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
         backgroundThrottling: false,
       },
     });
-    automationWindow.setOpacity(0);
-    automationWindow.show();
-    automationWindow.focus();
+    // WeChat's Wujie content app does not reliably bootstrap in a transparent
+    // off-screen window. Keep that publisher genuinely visible and focused.
+    if (requiresVisibleWindow) {
+      automationWindow.center();
+      automationWindow.setOpacity(1);
+      automationWindow.show();
+      automationWindow.focus();
+    } else {
+      automationWindow.setOpacity(0.01);
+    }
     const wc = automationWindow.webContents;
-    wc.focus();
+    wc.setUserAgent(chromeUserAgent);
+    wc.setAudioMuted(true);
+    if (requiresVisibleWindow) wc.focus();
+    let weixinDiagnosticListener:
+      | ((_event: Electron.Event, method: string, params: any) => void)
+      | undefined;
+    const weixinDiagnosticRequests = new Map<
+      string,
+      { method: string; url: string }
+    >();
     try {
       await progress(
         "opening",
         "正在进入" + platformMap[account.platform].name + "发布页面",
       );
-      await wc.loadURL(platformMap[account.platform].publishUrl);
+      await wc
+        .loadURL(platformMap[account.platform].publishUrl)
+        .catch(async (error) => {
+          const message = String(error);
+          void writeBrowserLog(
+            "publish-load-error account=" +
+              account.id +
+              " url=" +
+              wc.getURL() +
+              " error=" +
+              message,
+          );
+          if (!/ERR_ABORTED/.test(message)) throw error;
+          await sleep(1500);
+        });
+      if (account.platform === "weixin") {
+        this.weixinRemoteUploadAt.delete(wc.id);
+        this.weixinPublishPoints.delete(wc.id);
+        this.weixinPostListTitles.delete(wc.id);
+        if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+        await Promise.all([
+          wc.debugger.sendCommand("Runtime.enable"),
+          wc.debugger.sendCommand("Log.enable"),
+          wc.debugger.sendCommand("Network.enable"),
+        ]);
+        await Promise.all(
+          [wc.mainFrame, ...wc.mainFrame.framesInSubtree].map((frame) =>
+            frame.executeJavaScript(weixinPostListRecorder).catch(() => undefined),
+          ),
+        );
+        weixinDiagnosticListener = (_event, method, params) => {
+          let diagnostic: unknown;
+          if (method === "Runtime.consoleAPICalled") {
+            const args = (params.args || []).map((arg: any) =>
+              arg.value !== undefined ? arg.value : arg.description,
+            );
+            if (
+              args.some(
+                (value: unknown) =>
+                  typeof value === "string" && value.includes("@@@视频URL变化"),
+              ) &&
+              args.some(
+                (value: unknown) =>
+                  typeof value === "string" &&
+                  value.includes("finder.video.qq.com"),
+              )
+            )
+              this.weixinRemoteUploadAt.set(wc.id, Date.now());
+            diagnostic = {
+              type: params.type,
+              args,
+            };
+          } else if (method === "Runtime.exceptionThrown")
+            diagnostic = params.exceptionDetails;
+          else if (method === "Log.entryAdded") diagnostic = params.entry;
+          else if (method === "Network.loadingFailed") diagnostic = params;
+          else if (method === "Network.requestWillBeSent") {
+            const request = params.request || {};
+            const requestMethod = String(request.method || "");
+            const url = String(request.url || "");
+            if (requestMethod && requestMethod !== "GET") {
+              const relevant =
+                /(?:post|publish|create|finderassistant|mmfinderassistant|cgi-bin)/i.test(
+                  url,
+                );
+              if (relevant)
+                weixinDiagnosticRequests.set(String(params.requestId), {
+                  method: requestMethod,
+                  url,
+                });
+              diagnostic = {
+                requestId: params.requestId,
+                method: requestMethod,
+                url: redactWeixinDiagnostic(url, 4000),
+                relevant,
+                postData: redactWeixinDiagnostic(request.postData),
+              };
+            }
+          } else if (
+            method === "Network.webSocketFrameSent" ||
+            method === "Network.webSocketFrameReceived"
+          ) {
+            const payload = String(params.response?.payloadData || "");
+            if (
+              /(?:post|publish|create|finderassistant|mmfinderassistant|300002|errcode)/i.test(
+                payload,
+              )
+            )
+              diagnostic = {
+                requestId: params.requestId,
+                opcode: params.response?.opcode,
+                payloadData: redactWeixinDiagnostic(payload),
+              };
+          }
+          else if (
+            method === "Network.responseReceived" &&
+            (params.response?.status >= 400 ||
+              weixinDiagnosticRequests.has(String(params.requestId)))
+          ) {
+            const request = weixinDiagnosticRequests.get(
+              String(params.requestId),
+            );
+            diagnostic = {
+              requestId: params.requestId,
+              method: request?.method,
+              url: redactWeixinDiagnostic(params.response.url, 4000),
+              status: params.response.status,
+              statusText: params.response.statusText,
+              mimeType: params.response.mimeType,
+            };
+            if (request)
+              void wc.debugger
+                .sendCommand("Network.getResponseBody", {
+                  requestId: params.requestId,
+                })
+                .then((result: { body?: string; base64Encoded?: boolean }) =>
+                  writeBrowserLog(
+                    "weixin-network-response " +
+                      JSON.stringify({
+                        requestId: params.requestId,
+                        method: request.method,
+                        url: redactWeixinDiagnostic(request.url, 4000),
+                        status: params.response.status,
+                        base64Encoded: result.base64Encoded,
+                        body: redactWeixinDiagnostic(result.body),
+                      }),
+                  ),
+                )
+                .catch((error) =>
+                  writeBrowserLog(
+                    "weixin-network-response-error " +
+                      JSON.stringify({
+                        requestId: params.requestId,
+                        url: redactWeixinDiagnostic(request.url, 4000),
+                        error: String(error),
+                      }),
+                  ),
+                );
+            if (request && /\/post\/post_create(?:\?|$)/.test(request.url))
+              void wc.debugger
+                .sendCommand("Network.getResponseBody", {
+                  requestId: params.requestId,
+                })
+                .then((result: { body?: string }) => {
+                  const body = String(result.body || "");
+                  let parsed: any;
+                  try {
+                    parsed = JSON.parse(body);
+                  } catch {}
+                  this.weixinPostCreateResults.set(wc.id, {
+                    ok: Number(parsed?.errCode) === 0,
+                    errCode: Number.isFinite(Number(parsed?.errCode))
+                      ? Number(parsed.errCode)
+                      : undefined,
+                    body: redactWeixinDiagnostic(body, 4000),
+                  });
+                  void writeBrowserLog(
+                    "weixin-post-create-result " +
+                      JSON.stringify({
+                        ok: Number(parsed?.errCode) === 0,
+                        errCode: parsed?.errCode,
+                        body: redactWeixinDiagnostic(body, 4000),
+                      }),
+                  );
+                })
+                .catch(() => undefined);
+          } else if (method === "Network.loadingFinished") {
+            const request = weixinDiagnosticRequests.get(String(params.requestId));
+            if (request && /\/post\/post_list(?:\?|$)/.test(request.url))
+              void wc.debugger
+                .sendCommand("Network.getResponseBody", {
+                  requestId: params.requestId,
+                })
+                .then((result: { body?: string }) => {
+                  const titles = extractWeixinPostListTitles(
+                    String(result.body || ""),
+                  );
+                  if (titles.length) this.weixinPostListTitles.set(wc.id, titles);
+                  void writeBrowserLog(
+                    "weixin-post-list-cdp-evidence " +
+                      JSON.stringify({ titles: titles.slice(0, 80) }).slice(
+                        0,
+                        12000,
+                      ),
+                  );
+                })
+                .catch(() => undefined);
+          }
+          if (diagnostic !== undefined)
+            void writeBrowserLog(
+              "weixin-runtime " +
+                method +
+                " " +
+                redactWeixinDiagnostic(JSON.stringify(diagnostic)),
+            );
+        };
+        wc.debugger.on("message", weixinDiagnosticListener);
+      }
+      void writeBrowserLog(
+        "publish-loaded account=" +
+          account.id +
+          " url=" +
+          wc.getURL() +
+          " ua=" +
+          wc.getUserAgent(),
+      );
       await sleep(2500);
       const initialLogin = await this.getLoginState(account, wc);
       if (!initialLogin.loggedIn) {
@@ -110,10 +460,34 @@ export class BrowserManager {
             "登录已失效，请在账号管理重新扫码登录",
         };
       }
+      await this.flushAccountSession(account.id, "publish-login-check");
       await this.updateAccount(account.id, {
         loginStatus: "logged_in",
         ...(initialLogin.name ? { name: initialLogin.name } : {}),
       });
+      if (
+        account.platform === "weixin" &&
+        process.env.MULTIPUBLISH_PUBLISH_SELF_TEST_DRAFT_ID === draft.id
+      ) {
+        await progress("opening", "正在检查视频号后台，防止重复发布");
+        const existing = await this.verifyPublishedTitle(
+          wc,
+          account.platform,
+          draft.title,
+          20000,
+        );
+        if (existing.ok)
+          return {
+            status: "success" as const,
+            message: "视频号后台已存在目标标题，未重复发布",
+          };
+        await wc
+          .loadURL(platformMap[account.platform].publishUrl)
+          .catch((error) => {
+            if (!/ERR_ABORTED/.test(String(error))) throw error;
+          });
+        await sleep(3000);
+      }
       if (account.platform === "bilibili") {
         const hasStaleDraft = await wc
           .executeJavaScript(
@@ -137,10 +511,21 @@ export class BrowserManager {
       await progress("uploading", "正在等待平台上传控件");
       let videoNodeId = 0;
       if (account.platform === "bilibili") {
-        videoNodeId = await this.uploadBilibiliVideo(
+        videoNodeId = await this.uploadBilibiliVideo(wc, draft.mediaPaths[0]);
+      } else if (account.platform === "weixin") {
+        const inputs = await this.waitForFileInputs(wc, 60000);
+        const videoInput =
+          inputs.find((input) => /video/i.test(input.accept)) || inputs[0];
+        if (!videoInput) throw new Error("视频号上传控件不存在");
+        await writeBrowserLog(
+          "weixin-file-inputs " + JSON.stringify(inputs).slice(0, 10000),
+        );
+        await this.chooseFileFromInput(
           wc,
+          videoInput.nodeId,
           draft.mediaPaths[0],
         );
+        videoNodeId = videoInput.nodeId;
       } else {
         const inputs = await this.waitForFileInputs(wc, 60000);
         if (!inputs.length && account.platform === "douyin") {
@@ -179,7 +564,11 @@ export class BrowserManager {
           const uploadState = await wc.executeJavaScript(
             "(()=>{const visible=e=>!!e&&e.offsetParent!==null;const fields=[...document.querySelectorAll('input,textarea,[contenteditable=true]')].filter(visible);const title=fields.find(e=>/标题|稿件标题|视频标题/.test(e.getAttribute('placeholder')||''));const declaration=fields.find(e=>/创建声明|创作声明|自制声明/.test(e.getAttribute('placeholder')||''));const anchors=[title,declaration,fields.find(e=>/立即投稿|投稿类型/.test(e.parentElement?.innerText||''))].filter(Boolean);const root=anchors[0]?.closest('form,[class*=upload],[class*=投稿],[class*=editor]')||anchors[0]?.parentElement;const text=(root?.innerText||anchors.map(e=>e?.parentElement?.innerText||'').join('\\n')||'').slice(0,12000);const failed=/上传失败|转码失败|无视频流信息/.test(text);const uploading=/上传中|剩余时间|当前速度|已上传/.test(text)&&!/上传完成/.test(text);const editorReady=!!title||!!declaration||/立即投稿|投稿类型|自制声明/.test(text);const completed=!failed&&!uploading&&(editorReady||/上传完成/.test(text));return{completed,uploading,failed,text}})()",
           );
-          if (uploadState.completed && !uploadState.uploading && !uploadState.failed) {
+          if (
+            uploadState.completed &&
+            !uploadState.uploading &&
+            !uploadState.failed
+          ) {
             uploadFinished = true;
             break;
           }
@@ -710,7 +1099,7 @@ export class BrowserManager {
             throw new Error(
               "头条封面上传后未生成有效预览" +
                 (coverDiagnostics ? "：" + coverDiagnostics : ""),
-            );
+                );
           }
         } else {
           const nearbyCover =
@@ -973,6 +1362,7 @@ export class BrowserManager {
             "发表",
           ],
           true,
+          account.platform === "weixin",
         );
       }
       if (!clicked) throw new Error("没有找到可用的发布按钮");
@@ -990,6 +1380,19 @@ export class BrowserManager {
           if (confirmed) break;
         }
       }
+      if (account.platform === "weixin") {
+        const titlePatch =
+            "((fullTitle)=>{try{if(window.__multipublishPostPatch)return true;const shortTitle=Array.from(fullTitle).slice(0,12).join('');const patchBody=body=>{if(typeof body!=='string')return body;try{const data=JSON.parse(body);if(data?.objectDesc){data.objectDesc.mpTitle=shortTitle;data.objectDesc.shortTitle=[{shortTitle}];}return JSON.stringify(data)}catch{return body}};const fetch0=window.fetch;window.fetch=(input,init)=>{const url=typeof input==='string'?input:input?.url||'';if(/post\\/post_create/.test(url)&&init?.body)init={...init,body:patchBody(init.body)};return fetch0.call(window,input,init)};const open0=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(method,url){this.__multipublishUrl=String(url);return open0.apply(this,arguments)};const send0=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.send=function(body){if(/post\\/post_create/.test(this.__multipublishUrl||''))body=patchBody(body);return send0.call(this,body)};window.__multipublishPostPatch=true;return true}catch(error){return String(error)}})(" +
+          JSON.stringify(draft.title) +
+          ")";
+        const frames = [wc.mainFrame, ...wc.mainFrame.framesInSubtree];
+        await Promise.all(
+          frames.map((frame) => frame.executeJavaScript(titlePatch).catch(() => undefined)),
+        );
+        await writeBrowserLog(
+          "weixin-post-request-patch frames=" + String(frames.length),
+        );
+      }
       const result = await this.waitForResult(
         wc,
         account.platform,
@@ -1005,6 +1408,8 @@ export class BrowserManager {
       );
       if (result.challenge)
         return { status: "manual_required" as const, message: result.message };
+      if (!result.success && result.message)
+        return { status: "failed" as const, message: result.message };
       const verified = await this.verifyPublishedTitle(
         wc,
         account.platform,
@@ -1066,6 +1471,13 @@ export class BrowserManager {
         message: reason + (evidence ? "；现场截图：" + evidence : ""),
       };
     } finally {
+      this.weixinRemoteUploadAt.delete(wc.id);
+      this.weixinPublishPoints.delete(wc.id);
+      this.weixinPostCreateResults.delete(wc.id);
+      this.weixinPostListTitles.delete(wc.id);
+      if (weixinDiagnosticListener)
+        wc.debugger.removeListener("message", weixinDiagnosticListener);
+      await this.flushAccountSession(account.id, "publish-finished");
       if (!automationWindow.isDestroyed()) automationWindow.destroy();
     }
   }
@@ -1074,6 +1486,7 @@ export class BrowserManager {
     timeout: number,
   ) {
     if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+    await wc.debugger.sendCommand("Page.enable");
     await wc.debugger.sendCommand("DOM.enable");
     const startedAt = Date.now();
     while (Date.now() - startedAt < timeout) {
@@ -1132,6 +1545,7 @@ export class BrowserManager {
     timeout: number,
   ) {
     const start = Date.now();
+    let lastWeixinFrameDiagnosticAt = 0;
     while (Date.now() - start < timeout) {
       const url = wc.getURL();
       if (
@@ -1163,9 +1577,41 @@ export class BrowserManager {
       }
       if (platform === "weixin") {
         const ready = await wc.executeJavaScript(
-          "(()=>{const text=document.body?.innerText||'';return /发表视频|视频描述|声明原创/.test(text)&&!!document.querySelector('input[type=file],[contenteditable=true],textarea')})()",
+          "(()=>{const visible=e=>!!e&&e.offsetParent!==null;const all=root=>{const result=[];for(const e of root.querySelectorAll('*')){result.push(e);if(e.shadowRoot)result.push(...all(e.shadowRoot))}return result};const nodes=all(document);const fields=nodes.filter(e=>visible(e)&&(e.matches?.('input,textarea,[contenteditable=true]')||e.getAttribute?.('contenteditable')==='true'));const text=(document.body?.innerText||'')+' '+nodes.map(e=>(e.textContent||'').trim()).join(' ');const login=/扫码登录|手机号登录|验证码登录|APP扫一扫登录/.test(text);const editor=/视频描述|作品描述|发表视频|声明原创|原创声明|封面|发布设置|添加话题/.test(text);const uploadError=/上传失败|上传出错|视频格式不支持|文件损坏/.test(text);return{ok:/channels\\.weixin\\.qq\\.com\\/platform/.test(location.href)&&!login&&!uploadError&&fields.length>0&&editor,url:location.href,fields:fields.length,editor,uploadError,login,text:text.slice(-1800)}})()",
         );
-        if (ready) return true;
+        void writeBrowserLog(
+          "weixin-editor-check url=" +
+            wc.getURL() +
+            " result=" +
+            JSON.stringify(ready).slice(0, 2500),
+        );
+        if (ready?.ok) return true;
+        if (Date.now() - lastWeixinFrameDiagnosticAt >= 10000) {
+          lastWeixinFrameDiagnosticAt = Date.now();
+          const frameDiagnostics = await Promise.all(
+            wc.mainFrame.framesInSubtree.map(async (frame) => {
+              const state = await Promise.race([
+                frame
+                  .executeJavaScript(
+                    "(()=>{const summary=e=>({tag:e.tagName,text:(e.textContent||'').trim().slice(0,300),type:e.type||'',placeholder:e.getAttribute?.('placeholder')||'',className:String(e.className||'').slice(0,200),display:getComputedStyle(e).display,visibility:getComputedStyle(e).visibility,rect:(()=>{const r=e.getBoundingClientRect();return{x:r.x,y:r.y,width:r.width,height:r.height}})()});return{url:location.href,title:document.title,visibilityState:document.visibilityState,body:(document.body?.innerText||'').slice(-5000),fields:[...document.querySelectorAll('input,textarea,[contenteditable=true]')].map(summary),buttons:[...document.querySelectorAll('button,[role=button]')].map(summary),videos:[...document.querySelectorAll('video')].map(e=>({...summary(e),src:e.currentSrc||e.src,readyState:e.readyState,duration:e.duration,paused:e.paused}))}})()",
+                  )
+                  .catch((error) => ({ error: String(error) })),
+                new Promise<{ error: string }>((resolve) =>
+                  setTimeout(() => resolve({ error: "frame timeout" }), 2000),
+                ),
+              ]);
+              return {
+                frameUrl: frame.url,
+                frameName: frame.name,
+                state,
+              };
+            }),
+          );
+          await writeBrowserLog(
+            "weixin-frame-diagnostics " +
+              JSON.stringify(frameDiagnostics).slice(0, 30000),
+          );
+        }
       }
       if (platform === "bilibili") {
         const ready = await wc.executeJavaScript(
@@ -1418,8 +1864,41 @@ export class BrowserManager {
     trustedOnly = false,
   ) {
     if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+    const weixinPoint = this.weixinPublishPoints.get(wc.id);
+    if (
+      trustedOnly &&
+      weixinPoint &&
+      texts.some((text) => /发布|发表/.test(text))
+    ) {
+      await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x: weixinPoint.x,
+        y: weixinPoint.y,
+      });
+      await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+        type: "mousePressed",
+        x: weixinPoint.x,
+        y: weixinPoint.y,
+        button: "left",
+        buttons: 1,
+        clickCount: 1,
+      });
+      await sleep(120);
+      await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x: weixinPoint.x,
+        y: weixinPoint.y,
+        button: "left",
+        buttons: 0,
+        clickCount: 1,
+      });
+      await writeBrowserLog(
+        "weixin-publish-click " + JSON.stringify(weixinPoint),
+      );
+      return true;
+    }
     const script =
-      "((texts,preferBottom)=>{const visible=e=>!!e&&e.offsetParent!==null;const candidates=[...document.querySelectorAll('button,[role=button],a,div,span')].filter(e=>visible(e)&&texts.includes((e.textContent||'').trim())&&!e.disabled&&e.getAttribute('aria-disabled')!=='true');candidates.sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return(preferBottom?br.top-ar.top:ar.top-br.top)||((ar.width*ar.height)-(br.width*br.height))});const target=candidates[0];if(!target)return false;target.scrollIntoView({block:'center',inline:'center'});target.focus?.();target.click();return true})(" +
+      "((texts,preferBottom)=>{const visible=e=>!!e&&e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const result=[];for(const e of root.querySelectorAll('*')){result.push(e);if(e.shadowRoot)result.push(...all(e.shadowRoot))}return result};const candidates=all(document).filter(e=>e.matches?.('button,[role=button],a,div,span')&&visible(e)&&texts.includes((e.textContent||'').trim())&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&!String(e.className||'').includes('disabled'));candidates.sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return(preferBottom?br.top-ar.top:ar.top-br.top)||((ar.width*ar.height)-(br.width*br.height))});const target=candidates[0];if(!target)return false;target.scrollIntoView({block:'center',inline:'center'});target.focus?.();target.click();return true})(" +
       JSON.stringify(texts) +
       "," +
       JSON.stringify(preferBottom) +
@@ -1567,6 +2046,159 @@ export class BrowserManager {
         .catch(() => undefined);
     }
   }
+  private async chooseFileFromInput(
+    wc: Electron.WebContents,
+    backendNodeId: number,
+    file: string,
+  ) {
+    if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+    await wc.debugger.sendCommand("Page.enable");
+    await wc.debugger.sendCommand("DOM.enable");
+    const flattened = await wc.debugger.sendCommand(
+      "DOM.getFlattenedDocument",
+      { depth: -1, pierce: true },
+    );
+    const nodes = flattened.nodes as Array<{
+      nodeId: number;
+      backendNodeId?: number;
+      parentId?: number;
+      nodeName: string;
+    }>;
+    const byId = new Map(nodes.map((node) => [node.nodeId, node]));
+    let current = nodes.find(
+      (node) => (node.backendNodeId || node.nodeId) === backendNodeId,
+    );
+    const points: Array<{
+      nodeId: number;
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      depth: number;
+    }> = [];
+    for (let depth = 0; current && depth < 10; depth++) {
+      try {
+        const model = await wc.debugger.sendCommand("DOM.getBoxModel", {
+          nodeId: current.nodeId,
+        });
+        const quad = (model.model.border || model.model.content) as number[];
+        const xs = [quad[0], quad[2], quad[4], quad[6]],
+          ys = [quad[1], quad[3], quad[5], quad[7]],
+          width = Math.max(...xs) - Math.min(...xs),
+          height = Math.max(...ys) - Math.min(...ys);
+        if (width > 20 && height > 20 && width < 1200 && height < 800)
+          points.push({
+            nodeId: current.nodeId,
+            x: xs.reduce((sum, value) => sum + value, 0) / 4,
+            y: ys.reduce((sum, value) => sum + value, 0) / 4,
+            width,
+            height,
+            depth,
+          });
+      } catch {}
+      current = current.parentId ? byId.get(current.parentId) : undefined;
+    }
+    points.sort(
+      (a, b) => a.depth - b.depth || a.width * a.height - b.width * b.height,
+    );
+    const target = points[0];
+    if (!target) throw new Error("无法定位视频号上传控件的可点击区域");
+    const inputNode = nodes.find(
+      (node) => (node.backendNodeId || node.nodeId) === backendNodeId,
+    );
+    const ancestry: Array<Record<string, unknown>> = [];
+    current = inputNode;
+    for (let depth = 0; current && depth < 10; depth++) {
+      const outerHTML = await wc.debugger
+        .sendCommand("DOM.getOuterHTML", { nodeId: current.nodeId })
+        .then((result) => String(result.outerHTML || "").slice(0, 4000))
+        .catch(() => "");
+      const objectId = await wc.debugger
+        .sendCommand("DOM.resolveNode", { nodeId: current.nodeId })
+        .then((result) => result.object?.objectId as string | undefined)
+        .catch(() => undefined);
+      const listeners = objectId
+        ? await wc.debugger
+            .sendCommand("DOMDebugger.getEventListeners", { objectId })
+            .then((result) =>
+              (result.listeners || []).map((listener: any) => ({
+                type: listener.type,
+                useCapture: listener.useCapture,
+                passive: listener.passive,
+                scriptId: listener.scriptId,
+                lineNumber: listener.lineNumber,
+              })),
+            )
+            .catch(() => [])
+        : [];
+      ancestry.push({
+        depth,
+        nodeId: current.nodeId,
+        nodeName: current.nodeName,
+        outerHTML,
+        listeners,
+      });
+      current = current.parentId ? byId.get(current.parentId) : undefined;
+    }
+    let chooserNodeId: number | undefined;
+    let chooserOpened = false;
+    const listener = (_event: Electron.Event, method: string, params: any) => {
+      if (method !== "Page.fileChooserOpened") return;
+      chooserOpened = true;
+      chooserNodeId = params.backendNodeId || backendNodeId;
+      void writeBrowserLog(
+        "weixin-file-chooser-opened " + JSON.stringify(params),
+      );
+    };
+    wc.debugger.on("message", listener);
+    await wc.debugger.sendCommand("Page.setInterceptFileChooserDialog", {
+      enabled: true,
+    });
+    try {
+      await writeBrowserLog(
+        "weixin-upload-click " +
+          JSON.stringify({ backendNodeId, target, points, ancestry }).slice(
+            0,
+            30000,
+          ),
+      );
+      await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x: target.x,
+        y: target.y,
+      });
+      await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+        type: "mousePressed",
+        x: target.x,
+        y: target.y,
+        button: "left",
+        buttons: 1,
+        clickCount: 1,
+      });
+      await sleep(120);
+      await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x: target.x,
+        y: target.y,
+        button: "left",
+        buttons: 0,
+        clickCount: 1,
+      });
+      const startedAt = Date.now();
+      while (!chooserOpened && Date.now() - startedAt < 10000) await sleep(100);
+      if (!chooserOpened)
+        throw new Error("点击视频号上传区域后未打开文件选择器");
+      await wc.debugger.sendCommand("DOM.setFileInputFiles", {
+        backendNodeId: chooserNodeId || backendNodeId,
+        files: [file],
+      });
+    } finally {
+      wc.debugger.removeListener("message", listener);
+      await wc.debugger
+        .sendCommand("Page.setInterceptFileChooserDialog", { enabled: false })
+        .catch(() => undefined);
+    }
+  }
   private async waitForBilibiliVideoInput(
     wc: Electron.WebContents,
     timeout: number,
@@ -1617,8 +2249,7 @@ export class BrowserManager {
               score += 500;
             if (/draft|history|old|stale|草稿|历史|旧稿|已上传/i.test(context))
               score += 10000;
-            if (/upload|video|drag|上传|视频|拖拽/i.test(context))
-              score -= 100;
+            if (/upload|video|drag|上传|视频|拖拽/i.test(context)) score -= 100;
           }
           candidates.push({
             nodeId: node.backendNodeId || node.nodeId,
@@ -1652,8 +2283,7 @@ export class BrowserManager {
         false,
         true,
       );
-      if (!clicked)
-        throw new Error("Bilibili current upload button not found");
+      if (!clicked) throw new Error("Bilibili current upload button not found");
       const chooserStart = Date.now();
       while (Date.now() - chooserStart < 30000) {
         if (chooserNodeId) {
@@ -1782,6 +2412,23 @@ export class BrowserManager {
       } catch {}
       await sleep(1500);
     }
+    const frames = await Promise.all(
+      [wc.mainFrame, ...wc.mainFrame.framesInSubtree].map(async (frame) => {
+        const snapshot = await frame
+          .executeJavaScript(
+            "(()=>({url:location.href,readyState:document.readyState,visibility:document.visibilityState,hidden:document.hidden,inputs:document.querySelectorAll('input[type=file],input[accept]').length,text:(document.body?.innerText||'').slice(0,1200)}))()",
+          )
+          .catch((error) => ({ error: String(error) }));
+        return snapshot;
+      }),
+    );
+    await writeBrowserLog(
+      "file-input-timeout " +
+        redactWeixinDiagnostic(
+          JSON.stringify({ url: wc.getURL(), frames }),
+          12000,
+        ),
+    );
     return [];
   }
   private async getFileInputs(wc: Electron.WebContents) {
@@ -1791,7 +2438,11 @@ export class BrowserManager {
       "DOM.getFlattenedDocument",
       { depth: -1, pierce: true },
     );
-    const result: { nodeId: number; accept: string }[] = [];
+    const result: {
+      nodeId: number;
+      accept: string;
+      attributes: Record<string, string>;
+    }[] = [];
     for (const node of flattened.nodes as Array<{
       nodeId: number;
       nodeName: string;
@@ -1806,7 +2457,11 @@ export class BrowserManager {
       const type = (values.get("type") || "").toLowerCase(),
         accept = values.get("accept") || "";
       if (type === "file" || accept)
-        result.push({ nodeId: node.backendNodeId || node.nodeId, accept });
+        result.push({
+          nodeId: node.backendNodeId || node.nodeId,
+          accept,
+          attributes: Object.fromEntries(values),
+        });
     }
     return result;
   }
@@ -1832,10 +2487,194 @@ export class BrowserManager {
         ? 20
         : platform === "douyin" || platform === "toutiao"
           ? 30
+          : platform === "weixin"
+            ? 20
           : undefined;
     const title = titleLimit
       ? Array.from(draft.title).slice(0, titleLimit).join("")
       : draft.title;
+    if (platform === "weixin") {
+      if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+      await wc.debugger.sendCommand("DOM.enable");
+      const flattened = await wc.debugger.sendCommand(
+        "DOM.getFlattenedDocument",
+        { depth: -1, pierce: true },
+      );
+      const nodes = flattened.nodes as Array<{
+        nodeName: string;
+        backendNodeId?: number;
+        attributes?: string[];
+      }>;
+      const readAttributes = (node: (typeof nodes)[number]) => {
+        const attributes = node.attributes || [];
+        const result = new Map<string, string>();
+        for (let index = 0; index < attributes.length; index += 2)
+          result.set(attributes[index], attributes[index + 1] || "");
+        return result;
+      };
+      const visible = async (node: (typeof nodes)[number]) => {
+        if (!node.backendNodeId) return undefined;
+        try {
+          const model = await wc.debugger.sendCommand("DOM.getBoxModel", {
+            backendNodeId: node.backendNodeId,
+          });
+          const quad = (model.model.border || model.model.content) as number[];
+          const width = Math.max(quad[0], quad[2], quad[4], quad[6]) -
+            Math.min(quad[0], quad[2], quad[4], quad[6]);
+          const height = Math.max(quad[1], quad[3], quad[5], quad[7]) -
+            Math.min(quad[1], quad[3], quad[5], quad[7]);
+          return width * height > 100 ? width * height : undefined;
+        } catch {
+          return undefined;
+        }
+      };
+      const candidates = [] as Array<{
+        backendNodeId: number;
+        area: number;
+        kind: "title" | "description";
+        score: number;
+      }>;
+      for (const node of nodes) {
+        const attrs = readAttributes(node);
+        const placeholder =
+          attrs.get("placeholder") || attrs.get("data-placeholder") || "";
+        const isDescription = attrs.has("contenteditable");
+        const isTitle =
+          node.nodeName === "INPUT" &&
+          !/file|hidden/i.test(attrs.get("type") || "") &&
+          /标题|作品名称|视频名称/.test(placeholder);
+        if (!isDescription && !isTitle) continue;
+        const area = await visible(node);
+        if (!area || !node.backendNodeId) continue;
+        candidates.push({
+          backendNodeId: node.backendNodeId,
+          area,
+          kind: isDescription ? "description" : "title",
+          score:
+            (isDescription ? 0 : 100) +
+            (/短标题/.test(placeholder) ? -50 : 0) -
+            Math.min(area / 100000, 10),
+        });
+      }
+      const titleCandidate = candidates
+        .filter((candidate) => candidate.kind === "title")
+        .sort((a, b) => a.score - b.score || b.area - a.area)[0];
+      const descriptionCandidate = candidates
+        .filter((candidate) => candidate.kind === "description")
+        .sort((a, b) => b.area - a.area)[0];
+      const typeInto = async (backendNodeId: number, value: string) => {
+        await wc.debugger.sendCommand("DOM.focus", { backendNodeId });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+          type: "rawKeyDown",
+          key: "a",
+          code: "KeyA",
+          windowsVirtualKeyCode: 65,
+          modifiers: 2,
+        });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+          type: "rawKeyDown",
+          key: "Backspace",
+          code: "Backspace",
+          windowsVirtualKeyCode: 8,
+        });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+          type: "keyUp",
+          key: "Backspace",
+          code: "Backspace",
+          windowsVirtualKeyCode: 8,
+        });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+          type: "keyUp",
+          key: "a",
+          code: "KeyA",
+          windowsVirtualKeyCode: 65,
+          modifiers: 2,
+        });
+        await wc.debugger.sendCommand("Input.insertText", { text: value });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+          type: "keyDown",
+          key: "Tab",
+          code: "Tab",
+          windowsVirtualKeyCode: 9,
+        });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+          type: "keyUp",
+          key: "Tab",
+          code: "Tab",
+          windowsVirtualKeyCode: 9,
+        });
+        await sleep(700);
+      };
+      if (!titleCandidate || !descriptionCandidate)
+        throw new Error(
+          "未找到视频号真实短标题或描述控件：" +
+            JSON.stringify({
+              title: !!titleCandidate,
+              description: !!descriptionCandidate,
+              candidates: candidates.map(({ kind, area, score }) => ({
+                kind,
+                area,
+                score,
+              })),
+            }),
+        );
+      await typeInto(titleCandidate.backendNodeId, title);
+      // The title control is an `mp-input` Vue component.  In some Electron
+      // builds the native input receives the CDP keystrokes but the component
+      // listener does not receive the composed input event, leaving
+      // postObjDesc.mpTitle empty even though the textbox visibly contains
+      // the title.  Replay the component event as a fallback so the request
+      // is built from the same state as a normal user edit.
+      let titleComponentResult: unknown = { found: false };
+      try {
+        const resolved = await wc.debugger.sendCommand("DOM.resolveNode", {
+          backendNodeId: titleCandidate.backendNodeId,
+        });
+        const objectId = resolved.object?.objectId;
+        if (!objectId) throw new Error("title input object missing");
+        const invoked = await wc.debugger.sendCommand(
+          "Runtime.callFunctionOn",
+          {
+            objectId,
+            functionDeclaration:
+              "function(value){try{this.focus();const proto=Object.getPrototypeOf(this);const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;if(!setter)throw new Error('value setter missing');setter.call(this,value);this.dispatchEvent(new Event('input',{bubbles:true,composed:true}));this.dispatchEvent(new Event('change',{bubbles:true,composed:true}));this.blur();return{found:true,value:this.value,placeholder:this.getAttribute('placeholder')||''}}catch(error){return{found:false,error:String(error)}}}",
+            arguments: [{ value: title }],
+            returnByValue: true,
+          },
+        );
+        titleComponentResult = invoked.result?.value || { found: false };
+      } catch (error) {
+        titleComponentResult = { found: false, error: String(error) };
+      }
+      await Promise.resolve(titleComponentResult)
+        .then((result) =>
+          writeBrowserLog(
+            "weixin-title-component-input " + JSON.stringify(result),
+          ),
+        )
+        .catch((error) =>
+          writeBrowserLog(
+            "weixin-title-component-input-error " + String(error),
+          ),
+        );
+      await sleep(800);
+      await typeInto(descriptionCandidate.backendNodeId, draft.description);
+      const weixinFilled = await wc.executeJavaScript(
+        "(()=>{const all=root=>{const result=[];for(const e of root.querySelectorAll('*')){result.push(e);if(e.shadowRoot)result.push(...all(e.shadowRoot))}return result};const visible=e=>e&&e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';const fields=all(document).filter(e=>visible(e)&&(e.matches?.('input,textarea,[contenteditable]')||e.getAttribute?.('contenteditable')!==null));const title=fields.find(e=>e.tagName==='INPUT'&&/短标题|标题|作品名称|视频名称/.test(e.getAttribute('placeholder')||''));const description=fields.find(e=>e.getAttribute('contenteditable')!==null);return{title:typeof title?.value==='string'?title.value:title?.textContent||'',description:description?.textContent||''}})()",
+      );
+      if (
+        weixinFilled.title !== title ||
+        !weixinFilled.description.includes(draft.description)
+      )
+        throw new Error(
+          "视频号真实输入未生效：" +
+            JSON.stringify({ ...weixinFilled, expectedTitle: title }),
+        );
+      await writeBrowserLog(
+        "weixin-content-typed " + JSON.stringify(weixinFilled).slice(0, 5000),
+      );
+      return;
+    }
     const payload = JSON.stringify({
       title,
       description: draft.description,
@@ -1845,7 +2684,7 @@ export class BrowserManager {
     await wc.executeJavaScript(
       "(()=>{const data=" +
         payload +
-        ";const visible=e=>e&&e.offsetParent!==null;const set=(el,value)=>{if(!el)return false;el.focus();if(el.isContentEditable){el.textContent=value;el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}))}else{const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value')?.set;setter?setter.call(el,value):el.value=value;el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}))}return true};const fields=[...document.querySelectorAll('input,textarea,[contenteditable=true]')].filter(visible);const title=fields.find(e=>/标题|作品名称|视频名称/.test(e.getAttribute('placeholder')||''))||fields.find(e=>e.tagName==='INPUT'&&e.type==='text');set(title,data.title);const description=data.platform==='bilibili'?fields.find(e=>e.tagName==='TEXTAREA'&&/更全面|相关信息|视频/.test(e.getAttribute('placeholder')||''))||fields.find(e=>e.tagName==='TEXTAREA'):fields.find(e=>/简介|描述|正文|内容/.test(e.getAttribute('placeholder')||''))||fields.find(e=>e.tagName==='TEXTAREA')||fields.find(e=>e.isContentEditable&&e!==title);set(description,data.description);const tagField=fields.find(e=>/话题|标签/.test(e.getAttribute('placeholder')||''));if(tagField&&data.tags.length)set(tagField,data.tags.map(t=>'#'+t).join(' '));return{title:typeof title?.value==='string'?title.value:title?.textContent||'',description:typeof description?.value==='string'?description.value:description?.textContent||''}})()",
+        ";const visible=e=>e&&e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const result=[];for(const e of root.querySelectorAll('*')){result.push(e);if(e.shadowRoot)result.push(...all(e.shadowRoot))}return result};const set=(el,value)=>{if(!el)return false;el.focus();if(el.isContentEditable||el.hasAttribute?.('contenteditable')){el.textContent=value;el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));el.dispatchEvent(new Event('change',{bubbles:true}))}else{let proto=el;let setter;while(proto&&!setter){setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;proto=Object.getPrototypeOf(proto)}setter?setter.call(el,value):el.value=value;el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));el.dispatchEvent(new Event('change',{bubbles:true}))}el.blur?.();return true};const fields=all(document).filter(e=>visible(e)&&e.matches?.('input,textarea,[contenteditable]'));const hint=e=>(e.getAttribute('placeholder')||e.getAttribute('data-placeholder')||'');const title=fields.find(e=>/标题|作品名称|视频名称/.test(hint(e)))||fields.find(e=>e.tagName==='INPUT'&&e.type==='text');const description=data.platform==='bilibili'?fields.find(e=>e.tagName==='TEXTAREA'&&/更全面|相关信息|视频/.test(hint(e)))||fields.find(e=>e.tagName==='TEXTAREA'):fields.find(e=>/简介|描述|正文|内容/.test(hint(e)))||fields.find(e=>e.tagName==='TEXTAREA')||fields.find(e=>(e.isContentEditable||e.hasAttribute?.('contenteditable'))&&e!==title);const titleSet=set(title,data.title);const descriptionSet=set(description,data.description);const tagField=fields.find(e=>/话题|标签/.test(hint(e)));if(tagField&&data.tags.length)set(tagField,data.tags.map(t=>'#'+t).join(' '));return{titleSet,descriptionSet,title:typeof title?.value==='string'?title.value:title?.textContent||'',description:typeof description?.value==='string'?description.value:description?.textContent||'',fieldCount:fields.length}})()",
     );
   }
   private async waitForPublishReady(
@@ -1854,9 +2693,133 @@ export class BrowserManager {
     timeout: number,
   ) {
     const start = Date.now();
+    let lastDiagnosticAt = 0;
     while (Date.now() - start < timeout) {
+      if (platform === "weixin") {
+        const remoteUploadAt = this.weixinRemoteUploadAt.get(wc.id) || 0;
+        const remoteUploadAge = remoteUploadAt
+          ? Date.now() - remoteUploadAt
+          : 0;
+        if (!remoteUploadAt || remoteUploadAge < 8000) {
+          await sleep(1000);
+          continue;
+        }
+        try {
+          if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+          await wc.debugger.sendCommand("DOM.enable");
+          const tree = await wc.debugger.sendCommand(
+            "DOM.getFlattenedDocument",
+            {
+              depth: -1,
+              pierce: true,
+            },
+          );
+          const nodes = (tree.nodes || []) as Array<{
+            nodeId: number;
+            parentId?: number;
+            nodeName?: string;
+            nodeValue?: string;
+            attributes?: string[];
+          }>;
+          const byId = new Map(nodes.map((node) => [node.nodeId, node]));
+          const readAttributes = (node: (typeof nodes)[number]) => {
+            const attributes = node.attributes || [];
+            const result = new Map<string, string>();
+            for (let index = 0; index < attributes.length; index += 2)
+              result.set(attributes[index], attributes[index + 1] || "");
+            return result;
+          };
+          const text =
+            nodes.map((node) => node.nodeValue || "").join(" ") +
+            " " +
+            nodes.map((node) => (node.attributes || []).join(" ")).join(" ");
+          const uploading = /上传中|正在上传|转码中|上传进度|处理中/.test(text);
+          let publish = false;
+          let publishNodeId = 0;
+          let publishButton = "";
+          for (const textNode of nodes.filter(
+            (node) =>
+              node.nodeName === "#text" &&
+              /^(发布|发表)$/.test((node.nodeValue || "").trim()),
+          )) {
+            let current: (typeof nodes)[number] | undefined = textNode;
+            for (let depth = 0; current && depth < 8; depth++) {
+              const attributes = readAttributes(current);
+              if (
+                current.nodeName === "BUTTON" ||
+                attributes.get("role") === "button"
+              ) {
+                const className = attributes.get("class") || "";
+                const enabled =
+                  !attributes.has("disabled") &&
+                  attributes.get("aria-disabled") !== "true" &&
+                  !/disabled/.test(className);
+                publishButton = JSON.stringify({
+                  text: textNode.nodeValue,
+                  enabled,
+                  className,
+                  ariaDisabled: attributes.get("aria-disabled"),
+                });
+                if (enabled) {
+                  publish = true;
+                  publishNodeId = current.nodeId;
+                }
+                break;
+              }
+              current = current.parentId
+                ? byId.get(current.parentId)
+                : undefined;
+            }
+            if (publish) break;
+          }
+          if (publishNodeId) {
+            await wc.debugger.sendCommand("DOM.scrollIntoViewIfNeeded", {
+              nodeId: publishNodeId,
+            });
+            const model = await wc.debugger.sendCommand("DOM.getBoxModel", {
+              nodeId: publishNodeId,
+            });
+            const quad = (model.model.border ||
+              model.model.content) as number[];
+            this.weixinPublishPoints.set(wc.id, {
+              x: [quad[0], quad[2], quad[4], quad[6]].reduce(
+                (sum, value) => sum + value / 4,
+                0,
+              ),
+              y: [quad[1], quad[3], quad[5], quad[7]].reduce(
+                (sum, value) => sum + value / 4,
+                0,
+              ),
+            });
+          }
+          const uploaded = true;
+          if (Date.now() - lastDiagnosticAt >= 10000) {
+            lastDiagnosticAt = Date.now();
+            await writeBrowserLog(
+              "weixin-cdp-publish-ready " +
+                JSON.stringify({
+                  uploading,
+                  publish,
+                  uploaded,
+                  publishButton,
+                  remoteUploadAge,
+                  text: text.slice(-5000),
+                }),
+            );
+          }
+          if (
+            !uploading &&
+            publish &&
+            uploaded &&
+            this.weixinPublishPoints.has(wc.id)
+          )
+            return true;
+        } catch {}
+        await sleep(1500);
+        continue;
+      }
       const state = await wc.executeJavaScript(
-        "(()=>{const visible=e=>!!e&&e.offsetParent!==null;const text=document.body?.innerText||'';const buttons=[...document.querySelectorAll('button,[role=button],div,span')].filter(visible);const challenge=/扫码登录|验证码|安全验证|重新登录/.test(text);const uploading=/上传中|正在上传|转码中|上传进度/.test(text);const publish=buttons.some(b=>/^(发布|立即发布|确认发布|投稿|立即投稿|提交发布|发表)$/.test((b.textContent||'').trim())&&!b.disabled);const uploaded=/上传成功|上传完成|视频预览|智能封面|封面候选|视频文件|重新上传|检测为高清视频/.test(text)||!!document.querySelector('video');return{challenge,uploading,publish,uploaded,text,url:location.href}})()",
+        "(()=>{const visible=e=>!!e&&e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';const roots=[document],nodes=[];for(let i=0;i<roots.length;i++){for(const e of roots[i].querySelectorAll('*')){nodes.push(e);if(e.shadowRoot)roots.push(e.shadowRoot)}}const text=roots.map(root=>root===document?(document.body?.innerText||''):(root.textContent||'')).join(' ');const buttons=nodes.filter(e=>e.matches?.('button,[role=button],div,span')&&visible(e));const videos=nodes.filter(e=>e.tagName==='VIDEO');const challenge=/扫码登录|验证码|安全验证|重新登录/.test(text);const uploading=/上传中|正在上传|转码中|上传进度|文件上传中|处理中/.test(text);const publish=buttons.some(b=>/^(发布|立即发布|确认发布|投稿|立即投稿|提交发布|发表)$/.test((b.textContent||'').trim())&&!b.disabled&&b.getAttribute('aria-disabled')!=='true'&&!String(b.className||'').includes('disabled'));const videoReady=videos.some(v=>(v.currentSrc||v.src||'').includes('finder.video.qq.com')||(Number.isFinite(v.duration)&&v.duration>0&&v.readyState>=1));const uploaded=videoReady||/上传成功|上传完成|视频文件|重新上传|更换视频|移除视频|视频上传信息|封面预览/.test(text);return{challenge,uploading,publish,uploaded,videoReady,text:text.slice(-20000),url:location.href}})()",
       );
       if (state.challenge) throw new Error("平台要求登录或安全验证");
       if (
@@ -1899,6 +2862,19 @@ export class BrowserManager {
         url: wc.getURL(),
         reason: platformMap[platform].name + "尚未配置后台标题验真",
       };
+    if (platform === "weixin") {
+      try {
+        if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+        await wc.debugger.sendCommand("Page.enable");
+        await wc.debugger.sendCommand("Page.addScriptToEvaluateOnNewDocument", {
+          source: weixinPostListRecorder,
+        });
+      } catch (error) {
+        await writeBrowserLog(
+          "weixin-post-list-recorder-install-failed " + String(error),
+        );
+      }
+    }
     const limit =
       platform === "xiaohongshu"
         ? 20
@@ -1920,7 +2896,7 @@ export class BrowserManager {
       normalizedTitle.slice(0, 20),
       normalizedTitle.slice(0, 16),
       normalizedTitle.slice(0, 12),
-    ].filter((value) => value.length >= 8);
+    ].filter((value) => value.length >= 2);
     const start = Date.now();
     let lastUrl = "";
     while (Date.now() - start < timeout) {
@@ -1946,9 +2922,35 @@ export class BrowserManager {
       }
       const pollUntil = Math.min(start + timeout, Date.now() + 45000);
       while (Date.now() < pollUntil) {
+        if (platform === "weixin") {
+          const evidence = (await Promise.all(
+            [wc.mainFrame, ...wc.mainFrame.framesInSubtree].map((frame) =>
+              frame
+                .executeJavaScript(
+                  "(()=>({url:location.href,entries:Array.isArray(window.__multipublishPostListEvidence)?window.__multipublishPostListEvidence:[]}))()",
+                )
+                .catch(() => ({ url: "", entries: [] })),
+            ),
+          )) as Array<{ url: string; entries: any[] }>;
+          const exactEvidence = [
+            ...(this.weixinPostListTitles.get(wc.id) || []),
+            ...evidence
+              .flatMap((item) => item.entries || [])
+              .flatMap((entry: any) => entry.titles || []),
+          ];
+          await writeBrowserLog(
+            "weixin-post-list-evidence " +
+              JSON.stringify({
+                entries: exactEvidence.length,
+                titles: exactEvidence.slice(0, 80),
+              }).slice(0, 12000),
+          );
+          if (exactEvidence.some((value: unknown) => value === title))
+            return { ok: true, url: wc.getURL() };
+        }
         const snapshot = await wc
           .executeJavaScript(
-            "(()=>({url:location.href,text:(document.body?.innerText||'').slice(0,120000),login:/扫码登录|手机号登录|验证码登录|短信登录|密码登录|立即登录/.test(document.body?.innerText||'')||location.pathname.includes('/login')||location.pathname.includes('/auth')}))()",
+            "(()=>{const all=root=>{const result=[];for(const e of root.querySelectorAll('*')){result.push(e);if(e.shadowRoot)result.push(...all(e.shadowRoot))}return result};const text=((document.body?.innerText||'')+' '+all(document).map(e=>e.shadowRoot?(e.shadowRoot.innerText||e.shadowRoot.textContent||''):'').join(' ')).slice(0,120000);return{url:location.href,text,login:/扫码登录|手机号登录|验证码登录|短信登录|密码登录|立即登录/.test(text)||location.pathname.includes('/login')||location.pathname.includes('/auth')}})()",
           )
           .catch(() => ({ url: wc.getURL(), text: "", login: false }));
         lastUrl = snapshot.url;
@@ -1958,17 +2960,22 @@ export class BrowserManager {
             url: snapshot.url,
             reason: platformMap[platform].name + "作品管理要求重新登录",
           };
-        const rawExpected = [
-          platformTitle,
-          Array.from(platformTitle).slice(0, 24).join(""),
-          Array.from(platformTitle).slice(0, 20).join(""),
-          Array.from(platformTitle).slice(0, 16).join(""),
-          Array.from(platformTitle).slice(0, 12).join(""),
-        ].filter((value) => value.length >= 8);
+        const rawExpected =
+          platform === "weixin"
+            ? [platformTitle]
+            : [
+                platformTitle,
+                Array.from(platformTitle).slice(0, 24).join(""),
+                Array.from(platformTitle).slice(0, 20).join(""),
+                Array.from(platformTitle).slice(0, 16).join(""),
+                Array.from(platformTitle).slice(0, 12).join(""),
+              ].filter((value) => value.length >= 2);
         const normalizedText = normalize(snapshot.text);
         if (
           rawExpected.some((value) => snapshot.text.includes(value)) ||
-          expected.some((value) => normalizedText.includes(value))
+          (platform === "weixin"
+            ? normalizedText.includes(normalizedTitle)
+            : expected.some((value) => normalizedText.includes(value)))
         )
           return { ok: true, url: snapshot.url };
         await sleep(3000);
@@ -2000,12 +3007,37 @@ export class BrowserManager {
       challengeRequested = false;
     while (Date.now() - start < timeout) {
       const url = wc.getURL();
+      if (platform === "weixin") {
+        const postCreate = this.weixinPostCreateResults.get(wc.id);
+        if (postCreate && !postCreate.ok)
+          return {
+            success: false,
+            challenge: false,
+            message:
+              "视频号 post_create 返回失败：errCode=" +
+              String(postCreate.errCode ?? "unknown") +
+              " body=" +
+              postCreate.body,
+          };
+        if (postCreate?.ok && /platform\/post\/create/.test(url)) {
+          await wc
+            .loadURL("https://channels.weixin.qq.com/platform/post/list")
+            .catch((error) => {
+              if (!/ERR_ABORTED/.test(String(error))) throw error;
+            });
+          await sleep(2500);
+        }
+      }
       if (patterns[platform]?.test(url))
         return {
           success: true,
           challenge: false,
-          message: "已跳转到平台作品管理页，发布成功：" + url,
+          message: "已跳转到平台作品管理页，正在核验目标标题：" + url,
         };
+      if (platform === "weixin") {
+        await sleep(2000);
+        continue;
+      }
       const state = await wc.executeJavaScript(
         "(()=>{const text=(document.body?.innerText||'').slice(-12000);const success=/\u53d1\u5e03\u6210\u529f|\u6295\u7a3f\u6210\u529f|\u7a3f\u4ef6\u6295\u9012\u6210\u529f|\u53d1\u8868\u6210\u529f|\u4f5c\u54c1\u53d1\u5e03\u6210\u529f|\u63d0\u4ea4\u6210\u529f|\u5df2\u53d1\u5e03/.test(text);const visible=e=>!!e&&e.offsetParent!==null;const challengeTexts=[...document.querySelectorAll('div,span,p,h1,h2,h3,button')].filter(visible).map(e=>(e.textContent||'').trim()).filter(value=>value&&value.length<240&&/验证码|安全验证|扫码验证|手机验证/.test(value));const challengeText=challengeTexts.sort((a,b)=>a.length-b.length)[0]||'';const challenge=!!challengeText;const failed=/发布失败|投稿失败|上传失败|提交失败/.test(text);return{success,challenge,challengeText,failed,text:text.slice(-500)}})()",
       );
@@ -2036,7 +3068,7 @@ export class BrowserManager {
       if (state.failed)
         return {
           success: false,
-          challenge: true,
+          challenge: false,
           message: "平台返回发布失败：" + state.text,
         };
       if (
@@ -2069,11 +3101,9 @@ export class BrowserManager {
         return "";
       }
     })();
-    if (/login|passport|signin|auth/i.test(url))
-      return { loggedIn: false, name: "" };
     try {
       const result = await wc.executeJavaScript(
-        "(()=>{const visible=e=>!!e&&e.offsetParent!==null;const text=(document.body?.innerText||'').slice(0,12000);const selectors=['[class*=user-name]','[class*=username]','[class*=nickname]','[class*=account-name]','[class*=userName]','[class*=nickName]'];let name='';for(const selector of selectors){const node=[...document.querySelectorAll(selector)].find(visible);const value=node?.textContent?.trim();if(value&&value.length>1&&value.length<40){name=value;break}}const visibleLogin=[...document.querySelectorAll('main#login-form,.login-box-container,[class*=login-box],img[alt=qrcode]')].some(visible);const loginText=/扫码登录|手机号登录|验证码登录|QQ登录|微信登录|APP扫一扫登录/.test(text);return{name,visibleLogin,loginText,text}})()",
+        "(()=>{const visible=e=>!!e&&e.offsetParent!==null;const bodyText=document.body?.innerText||'';const text=bodyText.slice(0,12000);const selectors=['[class*=user-name]','[class*=username]','[class*=nickname]','[class*=account-name]','[class*=userName]','[class*=nickName]'];let name='';for(const selector of selectors){const node=[...document.querySelectorAll(selector)].find(visible);const value=node?.textContent?.trim();if(value&&value.length>1&&value.length<40){name=value;break}}const loginRoots=[...document.querySelectorAll('main#login-form,.login-box-container,[class*=login-box],[class*=login-container],[class*=qrcode],[class*=qr-code]')].filter(visible);const visibleLogin=loginRoots.length>0||[...document.querySelectorAll('img[alt*=qrcode i],img[src*=qrcode i]')].some(visible);const loginText=/扫码登录|手机号登录|验证码登录|QQ登录|微信登录|APP扫一扫登录/.test(text);return{name,visibleLogin,loginText,text}})()",
       );
       const stableKuaishouName =
         account.platform === "kuaishou"
@@ -2094,11 +3124,26 @@ export class BrowserManager {
       if (account.platform === "xiaohongshu")
         loggedIn = host === "creator.xiaohongshu.com" && !result.visibleLogin;
       if (account.platform === "weixin")
-        loggedIn =
-          host === "channels.weixin.qq.com" &&
-          !result.visibleLogin &&
-          !result.loginText &&
-          /发表视频|内容管理|数据概览|动态管理/.test(result.text);
+        loggedIn = (() => {
+          const pathname = (() => {
+            try {
+              return new URL(url).pathname;
+            } catch {
+              return "";
+            }
+          })();
+          const workspaceRoute = /^\/platform(?:\/|$)/.test(pathname);
+          const workspaceText =
+            /发表视频|内容管理|数据概览|动态管理|视频号助手|创作管理|数据中心/.test(
+              result.text,
+            );
+          return (
+            host === "channels.weixin.qq.com" &&
+            !result.visibleLogin &&
+            !result.loginText &&
+            (workspaceRoute || workspaceText)
+          );
+        })();
       if (account.platform === "toutiao")
         loggedIn =
           /mp.toutiao.com$/.test(host) &&
@@ -2117,25 +3162,71 @@ export class BrowserManager {
           /内容管理|发布|数据/.test(result.text);
       return {
         loggedIn,
+        pending:
+          !loggedIn &&
+          (result.visibleLogin ||
+            result.loginText ||
+            /login|passport|signin|auth/i.test(url) ||
+            result.text.trim().length < 20),
         name:
-          account.platform === "kuaishou"
-            ? stableKuaishouName
-            : result.name,
+          account.platform === "kuaishou" ? stableKuaishouName : result.name,
       };
     } catch {
-      return { loggedIn: false, name: "" };
+      return { loggedIn: false, pending: false, name: "" };
     }
   }
-  private async inspectAccount(account: Account, view: WebContentsView) {
+  private async inspectAccount(
+    account: Account,
+    view: WebContentsView,
+    expectedVersion?: number,
+  ) {
+    if (
+      expectedVersion !== undefined &&
+      this.inspectVersions.get(account.id) !== expectedVersion
+    )
+      return;
+    if (view.webContents.isLoading()) {
+      this.scheduleInspect(account, view);
+      return;
+    }
     const state = await this.getLoginState(account, view.webContents);
+    if (
+      expectedVersion !== undefined &&
+      this.inspectVersions.get(account.id) !== expectedVersion
+    )
+      return;
+    if (state.pending) {
+      void writeBrowserLog(
+        `login-pending account=${account.id} url=${view.webContents.getURL()}`,
+      );
+      await this.updateAccount(account.id, { loginStatus: "checking" });
+      const previous = this.inspectTimers.get(account.id);
+      if (previous) clearTimeout(previous);
+      const version = this.inspectVersions.get(account.id) || 0;
+      const timer = setTimeout(() => {
+        this.inspectTimers.delete(account.id);
+        void this.inspectAccount(account, view, version);
+      }, 1800);
+      this.inspectTimers.set(account.id, timer);
+      return;
+    }
     if (!state.loggedIn) {
+      void writeBrowserLog(
+        `login-failed account=${account.id} url=${view.webContents.getURL()}`,
+      );
       await this.updateAccount(account.id, { loginStatus: "logged_out" });
       return;
     }
+    // QR-login cookies and Web Storage are written asynchronously. Persist them
+    // before marking the account logged in so an upgrade/exit cannot lose them.
+    await this.flushAccountSession(account.id, "login-detected");
     await this.updateAccount(account.id, {
       loginStatus: "logged_in",
       ...(state.name ? { name: state.name } : {}),
     });
+    void writeBrowserLog(
+      `login-success account=${account.id} url=${view.webContents.getURL()} name=${state.name || ""}`,
+    );
   }
   hide() {
     if (!this.active) return;
@@ -2144,11 +3235,16 @@ export class BrowserManager {
       this.win.contentView.removeChildView(v);
     this.active = undefined;
   }
-  close(id: string) {
+  async close(id: string) {
+    const timer = this.inspectTimers.get(id);
+    if (timer) clearTimeout(timer);
+    this.inspectTimers.delete(id);
+    this.inspectVersions.delete(id);
     const v = this.views.get(id);
     if (!v) return;
     if (this.win.contentView.children.includes(v))
       this.win.contentView.removeChildView(v);
+    await this.flushAccountSession(id, "view-close");
     v.webContents.close();
     this.views.delete(id);
     if (this.active === id) this.active = undefined;
@@ -2172,10 +3268,18 @@ export class BrowserManager {
     if (action === "home" && account)
       wc.loadURL(platformMap[account.platform].homeUrl);
   }
-  remove(id: string) {
-    this.close(id);
+  async remove(id: string) {
+    await this.close(id);
   }
-  destroy() {
+  async destroy() {
+    for (const timer of this.inspectTimers.values()) clearTimeout(timer);
+    this.inspectTimers.clear();
+    this.inspectVersions.clear();
+    await Promise.all(
+      Array.from(this.views.keys(), (accountId) =>
+        this.flushAccountSession(accountId, "application-shutdown"),
+      ),
+    );
     for (const v of this.views.values()) v.webContents.close();
     this.views.clear();
   }
