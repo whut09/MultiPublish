@@ -574,7 +574,7 @@ export class BrowserManager {
         let uploadFinished = false;
         while (Date.now() - uploadStart < 240000) {
           const uploadState = await wc.executeJavaScript(
-            "(()=>{const visible=e=>!!e&&e.offsetParent!==null;const fields=[...document.querySelectorAll('input,textarea,[contenteditable=true]')].filter(visible);const title=fields.find(e=>/标题|稿件标题|视频标题/.test(e.getAttribute('placeholder')||''));const declaration=fields.find(e=>/创建声明|创作声明|自制声明/.test(e.getAttribute('placeholder')||''));const anchors=[title,declaration,fields.find(e=>/立即投稿|投稿类型/.test(e.parentElement?.innerText||''))].filter(Boolean);const root=anchors[0]?.closest('form,[class*=upload],[class*=投稿],[class*=editor]')||anchors[0]?.parentElement;const text=(root?.innerText||anchors.map(e=>e?.parentElement?.innerText||'').join('\\n')||'').slice(0,12000);const failed=/上传失败|转码失败|无视频流信息/.test(text);const uploading=/上传中|剩余时间|当前速度|已上传/.test(text)&&!/上传完成/.test(text);const editorReady=!!title||!!declaration||/立即投稿|投稿类型|自制声明/.test(text);const completed=!failed&&!uploading&&(editorReady||/上传完成/.test(text));return{completed,uploading,failed,text}})()",
+            "(()=>{const visible=e=>!!e&&e.offsetParent!==null;const fields=[...document.querySelectorAll('input,textarea,[contenteditable=true]')].filter(visible);const title=fields.find(e=>/标题|稿件标题|视频标题/.test(e.getAttribute('placeholder')||''));const declaration=fields.find(e=>/创建声明|创作声明|自制声明/.test(e.getAttribute('placeholder')||''));const anchors=[title,declaration,fields.find(e=>/立即投稿|投稿类型/.test(e.parentElement?.innerText||''))].filter(Boolean);const root=anchors[0]?.closest('form,[class*=upload],[class*=投稿],[class*=editor]')||anchors[0]?.parentElement;const text=(root?.innerText||anchors.map(e=>e?.parentElement?.innerText||'').join('\\n')||'').slice(0,12000);const failed=/上传失败|转码失败|无视频流信息/.test(text);const editorReady=!!title||!!declaration||/立即投稿|投稿类型|自制声明|视频封面|添加标签/.test(text);const completed=!failed&&(editorReady||/上传完成|已上传|视频预览/.test(text));const uploading=!completed&&/上传中|剩余时间|当前速度|上传进度/.test(text);return{completed,uploading,failed,text}})()",
           );
           if (
             uploadState.completed &&
@@ -1049,8 +1049,15 @@ export class BrowserManager {
               false,
               true,
             );
-            if (!localUploadOpened)
-              throw new Error("未找到头条本地上传封面页签");
+            if (!localUploadOpened) {
+              const semanticOpened = await wc
+                .executeJavaScript(
+                  "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const nodes=all(document).filter(visible);const target=nodes.filter(e=>{const s=((e.textContent||'')+' '+(e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||'')).trim();return /本地|图片|上传|选择/.test(s)&&e.children.length<8}).sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return ar.width*ar.height-br.width*br.height})[0];if(!target)return false;target.click();return true})()",
+                )
+                .catch(() => false);
+              if (!semanticOpened)
+                throw new Error("未找到头条本地上传封面页签");
+            }
             localCoverInput = await this.waitForMatchingFileInput(
               wc,
               "image",
@@ -2300,11 +2307,19 @@ export class BrowserManager {
     try {
       const clicked = await this.clickButtonByText(
         wc,
-        ["上传视频", "点击上传视频", "选择视频", "点击上传"],
+        ["上传视频", "点击上传视频", "选择视频", "点击上传", "上传文件", "选择文件"],
         false,
         true,
       );
-      if (!clicked) throw new Error("Bilibili current upload button not found");
+      if (!clicked) {
+        const fallbackClicked = await wc
+          .executeJavaScript(
+            "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const nodes=all(document).filter(visible);const target=nodes.filter(e=>/上传|选择|拖拽/.test((e.textContent||'')+' '+(e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||''))&&/视频|文件|video|upload/i.test((e.textContent||'')+' '+(e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||'')+' '+String(e.className||''))).sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return ar.width*ar.height-br.width*br.height})[0];if(!target)return false;target.click();return true})()",
+          )
+          .catch(() => false);
+        if (!fallbackClicked)
+          throw new Error("Bilibili current upload button not found");
+      }
       const chooserStart = Date.now();
       while (Date.now() - chooserStart < 30000) {
         if (chooserNodeId) {
