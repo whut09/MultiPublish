@@ -173,6 +173,18 @@ export class BrowserManager {
     await this.updateAccount(account.id, { loginStatus: "checking" });
     await sleep(1000);
     await this.inspectAccount(account, view);
+    // 平台后台多为单页应用，扫码或会话恢复后的跳转不总是触发导航事件；
+    // 在一段时间内补几次检测，保证登录态徽标能及时翻转。
+    for (const delay of [2000, 5000, 12000, 25000, 45000])
+      setTimeout(() => {
+        if (
+          view!.webContents.isDestroyed() ||
+          this.win.isDestroyed() ||
+          !this.win.contentView.children.includes(view!)
+        )
+          return;
+        this.inspectAccount(account, view!).catch(() => undefined);
+      }, delay);
   }
 
   private scheduleInspect(account: Account, view: WebContentsView) {
@@ -1018,25 +1030,34 @@ export class BrowserManager {
         if (account.platform === "toutiao") {
           const coverModalOpened = await this.clickButtonByText(
             wc,
-            ["上传封面"],
+            ["上传封面", "设置封面", "更换封面", "选择封面"],
             false,
             true,
           );
           if (!coverModalOpened) throw new Error("未找到头条上传封面入口");
           await sleep(1200);
-          const localUploadOpened = await this.clickButtonByText(
-            wc,
-            ["本地上传"],
-            false,
-            true,
-          );
-          if (!localUploadOpened) throw new Error("未找到头条本地上传封面页签");
-          const localCoverInput = await this.waitForMatchingFileInput(
+          let localCoverInput = await this.waitForMatchingFileInput(
             wc,
             "image",
-            15000,
+            2500,
             [videoNodeId],
           );
+          if (!localCoverInput) {
+            const localUploadOpened = await this.clickButtonByText(
+              wc,
+              ["本地上传", "本地上传图片", "上传图片", "从本地选择", "选择本地图片"],
+              false,
+              true,
+            );
+            if (!localUploadOpened)
+              throw new Error("未找到头条本地上传封面页签");
+            localCoverInput = await this.waitForMatchingFileInput(
+              wc,
+              "image",
+              15000,
+              [videoNodeId],
+            );
+          }
           if (localCoverInput)
             await this.setFileInput(wc, localCoverInput.nodeId, [
               draft.coverPath,
@@ -1044,7 +1065,7 @@ export class BrowserManager {
           else
             await this.chooseFileFromButton(
               wc,
-              ["本地上传", "点击上传", "上传图片"],
+              ["本地上传", "本地上传图片", "点击上传", "上传图片", "从本地选择"],
               draft.coverPath,
             );
           await sleep(1800);
@@ -1615,9 +1636,9 @@ export class BrowserManager {
       }
       if (platform === "bilibili") {
         const ready = await wc.executeJavaScript(
-          "(()=>{const visible=e=>!!e&&e.offsetParent!==null;const url=/member\\.bilibili\\.com\\/platform\\/upload\\/video/.test(location.href);const fields=[...document.querySelectorAll('input,textarea,[contenteditable=true]')].filter(visible);const title=fields.some(e=>/标题|稿件标题|视频标题/.test(e.getAttribute('placeholder')||''));const declaration=fields.some(e=>/创建声明|创作声明|自制声明/.test(e.getAttribute('placeholder')||''));const text=fields.map(e=>(e.parentElement?.innerText||'').slice(0,600)).join('\\n')+'\\n'+[...document.querySelectorAll('button,[role=button]')].filter(visible).map(e=>(e.textContent||'').trim()).join('\\n');return url&&(title||declaration||/立即投稿|投稿类型|自制声明/.test(text))})()",
+          "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const result=[];for(const e of root.querySelectorAll('*')){result.push(e);if(e.shadowRoot)result.push(...all(e.shadowRoot))}return result};const nodes=all(document);const url=/member\\.bilibili\\.com\\/platform\\/upload\\/video(?:\\/|$)/.test(location.href);const fields=nodes.filter(e=>visible(e)&&(e.matches?.('input,textarea,[contenteditable=true]')||e.getAttribute?.('contenteditable')==='true'));const title=fields.some(e=>/标题|稿件标题|视频标题/.test(e.getAttribute?.('placeholder')||''));const declaration=fields.some(e=>/创建声明|创作声明|自制声明/.test(e.getAttribute?.('placeholder')||''));const text=((document.body?.innerText||'')+' '+nodes.map(e=>(e.textContent||'').trim()).join(' ')).slice(-16000);const editor=title||declaration||/立即投稿|立即投稿|投稿类型|自制声明|添加标签|视频封面/.test(text);const uploadDone=/上传完成|视频已上传|转码完成|视频预览/.test(text)||nodes.some(e=>visible(e)&&e.tagName==='VIDEO');return{ok:url&&editor,uploadDone,fields:fields.length,url,text:text.slice(-1800)}})()",
         );
-        if (ready) return true;
+        if (ready?.ok || (ready?.uploadDone && ready?.fields > 0)) return true;
       }
       if (
         !["douyin", "xiaohongshu", "kuaishou", "weixin", "bilibili"].includes(
