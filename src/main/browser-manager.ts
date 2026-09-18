@@ -212,13 +212,14 @@ export class BrowserManager {
         status: "failed" as const,
         message: "视频文件不存在或为空：" + videoPath,
       };
-    const requiresVisibleWindow = account.platform === "weixin";
+    const requiresVisibleWindow = false;
     const automationWindow = new BrowserWindow({
-      show: true,
-      skipTaskbar: !requiresVisibleWindow,
+      show: false,
+      skipTaskbar: true,
       autoHideMenuBar: true,
-      title: requiresVisibleWindow ? "MultiPublish - 视频号发布" : "MultiPublish",
-      ...(requiresVisibleWindow ? {} : { x: -10000, y: -10000 }),
+      title: "MultiPublish",
+      x: -10000,
+      y: -10000,
       width: 1280,
       height: 900,
       webPreferences: {
@@ -229,20 +230,10 @@ export class BrowserManager {
         backgroundThrottling: false,
       },
     });
-    // WeChat's Wujie content app does not reliably bootstrap in a transparent
-    // off-screen window. Keep that publisher genuinely visible and focused.
-    if (requiresVisibleWindow) {
-      automationWindow.center();
-      automationWindow.setOpacity(1);
-      automationWindow.show();
-      automationWindow.focus();
-    } else {
-      automationWindow.setOpacity(0.01);
-    }
+    automationWindow.setOpacity(0.01);
     const wc = automationWindow.webContents;
     wc.setUserAgent(chromeUserAgent);
     wc.setAudioMuted(true);
-    if (requiresVisibleWindow) wc.focus();
     let weixinDiagnosticListener:
       | ((_event: Electron.Event, method: string, params: any) => void)
       | undefined;
