@@ -572,22 +572,21 @@ export class BrowserManager {
       if (account.platform === "bilibili") {
         const uploadStart = Date.now();
         let uploadFinished = false;
-        while (Date.now() - uploadStart < 240000) {
+        while (Date.now() - uploadStart < 30000) {
           const uploadState = await wc.executeJavaScript(
             "(()=>{const visible=e=>!!e&&e.offsetParent!==null;const fields=[...document.querySelectorAll('input,textarea,[contenteditable=true]')].filter(visible);const title=fields.find(e=>/标题|稿件标题|视频标题/.test(e.getAttribute('placeholder')||''));const declaration=fields.find(e=>/创建声明|创作声明|自制声明/.test(e.getAttribute('placeholder')||''));const anchors=[title,declaration,fields.find(e=>/立即投稿|投稿类型/.test(e.parentElement?.innerText||''))].filter(Boolean);const root=anchors[0]?.closest('form,[class*=upload],[class*=投稿],[class*=editor]')||anchors[0]?.parentElement;const text=(root?.innerText||anchors.map(e=>e?.parentElement?.innerText||'').join('\\n')||'').slice(0,12000);const failed=/上传失败|转码失败|无视频流信息/.test(text);const editorReady=!!title||!!declaration||/立即投稿|投稿类型|自制声明|视频封面|添加标签/.test(text);const completed=!failed&&(editorReady||/上传完成|已上传|视频预览/.test(text));const uploading=!completed&&/上传中|剩余时间|当前速度|上传进度/.test(text);return{completed,uploading,failed,text}})()",
           );
-          if (
-            uploadState.completed &&
-            !uploadState.uploading &&
-            !uploadState.failed
-          ) {
+          if (uploadState.failed) throw new Error("B站平台返回视频上传失败");
+          // waitForEditor has already confirmed the editable form. Bilibili
+          // often leaves a stale progress label in the DOM after completion.
+          if (uploadState.completed || !uploadState.uploading) {
             uploadFinished = true;
             break;
           }
-          if (uploadState.failed) throw new Error("B站平台返回视频上传失败");
           await sleep(1500);
         }
-        if (!uploadFinished) throw new Error("B站视频上传未在等待时间内完成");
+        if (!uploadFinished)
+          throw new Error("B站视频上传未在等待时间内完成，请检查平台处理状态");
       }
       if (account.platform !== "douyin")
         await this.fillContent(wc, draft, account.platform);
@@ -1022,18 +1021,35 @@ export class BrowserManager {
           600000,
         );
         if (!toutiaoVideoReady) throw new Error("头条视频上传完成超时");
+        // Toutiao replaces the form after video processing completes. Re-apply
+        // the title after that rerender so the final publish request does not
+        // restore the original over-30-character draft title.
+        await this.fillContent(wc, draft, "toutiao");
       }
       if (
         draft.coverPath &&
         (account.platform === "douyin" || account.platform === "toutiao")
       ) {
         if (account.platform === "toutiao") {
-          const coverModalOpened = await this.clickButtonByText(
-            wc,
-            ["上传封面", "设置封面", "更换封面", "选择封面"],
-            false,
-            true,
-          );
+          try {
+          const coverBefore = await wc
+            .executeJavaScript(
+              "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';return JSON.stringify({url:location.href,body:(document.body?.innerText||'').slice(-14000),controls:[...document.querySelectorAll('button,[role=button],a,input,textarea,[contenteditable=true],div,span,label')].filter(visible).map(e=>({tag:e.tagName,text:(e.textContent||'').trim().slice(0,240),aria:e.getAttribute('aria-label'),title:e.getAttribute('title'),placeholder:e.getAttribute('placeholder'),type:e.getAttribute('type'),disabled:!!e.disabled,cls:String(e.className||'').slice(0,180)})).filter(e=>e.text||e.aria||e.title||e.placeholder).slice(-400)})})()",
+            )
+            .catch(() => "");
+          void writeBrowserLog("toutiao-cover-before " + coverBefore.slice(0, 18000));
+          const coverModalOpened =
+            (await wc
+              .executeJavaScript(
+                "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const e=[...document.querySelectorAll('.xigua-poster-editor .fake-upload-trigger,.xigua-poster-editor [class*=upload-trigger]')].find(visible);if(!e)return false;(e.closest('button,[role=button]')||e).click();return true})()",
+              )
+              .catch(() => false)) ||
+            (await this.clickButtonByText(
+              wc,
+              ["上传封面", "设置封面", "更换封面", "选择封面", "编辑封面", "视频封面"],
+              false,
+              false,
+            ));
           if (!coverModalOpened) throw new Error("未找到头条上传封面入口");
           await sleep(1200);
           let localCoverInput = await this.waitForMatchingFileInput(
@@ -1047,7 +1063,7 @@ export class BrowserManager {
               wc,
               ["本地上传", "本地上传图片", "上传图片", "从本地选择", "选择本地图片"],
               false,
-              true,
+              false,
             );
             if (!localUploadOpened) {
               const semanticOpened = await wc
@@ -1124,10 +1140,25 @@ export class BrowserManager {
                 "(()=>JSON.stringify({buttons:[...document.querySelectorAll('button,[role=button]')].filter(e=>e.offsetParent!==null).map(e=>(e.textContent||'').trim()).filter(Boolean).slice(-50),dialogs:[...document.querySelectorAll('[role=dialog],[class*=modal],[class*=dialog]')].filter(e=>e.offsetParent!==null).map(e=>(e.textContent||'').trim()).filter(Boolean).slice(-20),body:(document.body?.innerText||'').slice(-5000)}))()",
               )
               .catch(() => "");
-            throw new Error(
-              "头条封面上传后未生成有效预览" +
-                (coverDiagnostics ? "：" + coverDiagnostics : ""),
-                );
+            void writeBrowserLog(
+              "toutiao-cover-not-ready " +
+                (coverDiagnostics ? coverDiagnostics.slice(0, 6000) : ""),
+            );
+          }
+          } catch (error) {
+            // A custom cover is optional; platform UI changes must not block
+            // an otherwise valid video submission.
+            const coverFailureState = await wc
+              .executeJavaScript(
+                "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const nodes=[...document.querySelectorAll('button,[role=button],a,input,textarea,[contenteditable=true],div,span,label')].filter(visible);return JSON.stringify({url:location.href,body:(document.body?.innerText||'').slice(-12000),controls:nodes.map(e=>({tag:e.tagName,text:(e.textContent||'').trim().slice(0,300),aria:e.getAttribute('aria-label'),title:e.getAttribute('title'),placeholder:e.getAttribute('placeholder'),type:e.getAttribute('type'),disabled:!!e.disabled,cls:String(e.className||'').slice(0,200)})).filter(e=>e.text||e.aria||e.title||e.placeholder).slice(-300)})})()",
+              )
+              .catch(() => "");
+            void writeBrowserLog(
+              "toutiao-cover-skipped " +
+                String(error).slice(0, 4000) +
+                " state=" +
+                coverFailureState.slice(0, 16000),
+            );
           }
         } else {
           const nearbyCover =
@@ -1394,6 +1425,19 @@ export class BrowserManager {
         );
       }
       if (!clicked) throw new Error("没有找到可用的发布按钮");
+      if (account.platform === "toutiao") {
+        await sleep(5000);
+        const current = await wc.getURL();
+        if (/xigua\/upload-video/.test(current)) {
+          const retry = await this.clickButtonByText(
+            wc,
+            ["发布"],
+            true,
+            false,
+          );
+          await writeBrowserLog("toutiao-publish-retry " + String(retry));
+        }
+      }
       if (
         account.platform === "kuaishou" ||
         account.platform === "xiaohongshu"
@@ -2717,11 +2761,94 @@ export class BrowserManager {
       tags: draft.topics,
       platform,
     });
-    await wc.executeJavaScript(
+    const genericFilled = await wc.executeJavaScript(
       "(()=>{const data=" +
         payload +
-        ";const visible=e=>e&&e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const result=[];for(const e of root.querySelectorAll('*')){result.push(e);if(e.shadowRoot)result.push(...all(e.shadowRoot))}return result};const set=(el,value)=>{if(!el)return false;el.focus();if(el.isContentEditable||el.hasAttribute?.('contenteditable')){el.textContent=value;el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));el.dispatchEvent(new Event('change',{bubbles:true}))}else{let proto=el;let setter;while(proto&&!setter){setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;proto=Object.getPrototypeOf(proto)}setter?setter.call(el,value):el.value=value;el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));el.dispatchEvent(new Event('change',{bubbles:true}))}el.blur?.();return true};const fields=all(document).filter(e=>visible(e)&&e.matches?.('input,textarea,[contenteditable]'));const hint=e=>(e.getAttribute('placeholder')||e.getAttribute('data-placeholder')||'');const title=fields.find(e=>/标题|作品名称|视频名称/.test(hint(e)))||fields.find(e=>e.tagName==='INPUT'&&e.type==='text');const description=data.platform==='bilibili'?fields.find(e=>e.tagName==='TEXTAREA'&&/更全面|相关信息|视频/.test(hint(e)))||fields.find(e=>e.tagName==='TEXTAREA'):fields.find(e=>/简介|描述|正文|内容/.test(hint(e)))||fields.find(e=>e.tagName==='TEXTAREA')||fields.find(e=>(e.isContentEditable||e.hasAttribute?.('contenteditable'))&&e!==title);const titleSet=set(title,data.title);const descriptionSet=set(description,data.description);const tagField=fields.find(e=>/话题|标签/.test(hint(e)));if(tagField&&data.tags.length)set(tagField,data.tags.map(t=>'#'+t).join(' '));return{titleSet,descriptionSet,title:typeof title?.value==='string'?title.value:title?.textContent||'',description:typeof description?.value==='string'?description.value:description?.textContent||'',fieldCount:fields.length}})()",
+        ";const visible=e=>e&&e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const result=[];for(const e of root.querySelectorAll('*')){result.push(e);if(e.shadowRoot)result.push(...all(e.shadowRoot))}return result};const set=(el,value)=>{if(!el)return false;el.focus();if(el.isContentEditable||el.hasAttribute?.('contenteditable')){el.textContent=value;el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));el.dispatchEvent(new Event('change',{bubbles:true}))}else{let proto=el;let setter;while(proto&&!setter){setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;proto=Object.getPrototypeOf(proto)}setter?setter.call(el,value):el.value=value;el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));el.dispatchEvent(new Event('change',{bubbles:true}))}el.blur?.();return true};const fields=all(document).filter(e=>visible(e)&&e.matches?.('input,textarea,[contenteditable]'));const hint=e=>(e.getAttribute('placeholder')||e.getAttribute('data-placeholder')||'');const title=fields.find(e=>/标题|作品名称|视频名称|0～30|0-30/.test(hint(e)))||fields.find(e=>e.tagName==='INPUT'&&e.type==='text');const description=data.platform==='bilibili'?fields.find(e=>e.tagName==='TEXTAREA'&&/更全面|相关信息|视频/.test(hint(e)))||fields.find(e=>e.tagName==='TEXTAREA'):fields.find(e=>/简介|描述|正文|内容/.test(hint(e)))||fields.find(e=>e.tagName==='TEXTAREA')||fields.find(e=>(e.isContentEditable||e.hasAttribute?.('contenteditable'))&&e!==title);const titleSet=set(title,data.title);const descriptionSet=set(description,data.description);const tagField=fields.find(e=>/话题|标签/.test(hint(e)));if(tagField&&data.tags.length)set(tagField,data.tags.map(t=>'#'+t).join(' '));return{titleSet,descriptionSet,title:typeof title?.value==='string'?title.value:title?.textContent||'',description:typeof description?.value==='string'?description.value:description?.textContent||'',fieldCount:fields.length}})()",
     );
+    if (platform === "toutiao") {
+      if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+      await wc.debugger.sendCommand("DOM.enable");
+      const flat = await wc.debugger.sendCommand("DOM.getFlattenedDocument", {
+        depth: -1,
+        pierce: true,
+      });
+      const titleNodes = (flat.nodes as Array<{
+        nodeName: string;
+        backendNodeId?: number;
+        attributes?: string[];
+      }>).filter((node) => {
+        if (node.nodeName !== "INPUT" || !node.backendNodeId) return false;
+        const attrs = node.attributes || [];
+        for (let i = 0; i < attrs.length; i += 2)
+          if (
+            attrs[i] === "placeholder" &&
+            /0[～-]30|标题/.test(attrs[i + 1] || "")
+          )
+            return true;
+        return false;
+      });
+      const titleNode = titleNodes.at(-1);
+      if (titleNode?.backendNodeId) {
+        await wc.debugger.sendCommand("DOM.focus", {
+          backendNodeId: titleNode.backendNodeId,
+        });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+          type: "rawKeyDown",
+          key: "a",
+          code: "KeyA",
+          windowsVirtualKeyCode: 65,
+          modifiers: 2,
+        });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+          type: "keyDown",
+          key: "Backspace",
+          code: "Backspace",
+          windowsVirtualKeyCode: 8,
+        });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+          type: "keyUp",
+          key: "Backspace",
+          code: "Backspace",
+          windowsVirtualKeyCode: 8,
+        });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+          type: "keyUp",
+          key: "a",
+          code: "KeyA",
+          windowsVirtualKeyCode: 65,
+          modifiers: 2,
+        });
+        await wc.debugger.sendCommand("Input.insertText", { text: title });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+          type: "keyDown",
+          key: "Tab",
+          code: "Tab",
+          windowsVirtualKeyCode: 9,
+        });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+          type: "keyUp",
+          key: "Tab",
+          code: "Tab",
+          windowsVirtualKeyCode: 9,
+        });
+        await sleep(700);
+      }
+      const titleState = await wc
+        .executeJavaScript(
+          "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const e=[...document.querySelectorAll('input')].find(e=>visible(e)&&/0[～-]30|标题/.test(e.placeholder||''));return{value:e?.value||'',placeholder:e?.placeholder||''}})()",
+        )
+        .catch(() => ({ value: "", placeholder: "" }));
+      await writeBrowserLog(
+        "toutiao-content-typed " +
+          JSON.stringify({ genericFilled, titleState, expectedTitle: title }),
+      );
+      if (titleState.value !== title)
+        throw new Error(
+          "头条标题输入未生效：" +
+            JSON.stringify({ titleState, expectedTitle: title }),
+        );
+    }
   }
   private async waitForPublishReady(
     wc: Electron.WebContents,
