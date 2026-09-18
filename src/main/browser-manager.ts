@@ -303,8 +303,10 @@ export class BrowserManager {
                   typeof value === "string" &&
                   value.includes("finder.video.qq.com"),
               )
-            )
+            ) {
+              this.weixinUploadFailures.delete(wc.id);
               this.weixinRemoteUploadAt.set(wc.id, Date.now());
+            }
             diagnostic = {
               type: params.type,
               args,
@@ -317,6 +319,11 @@ export class BrowserManager {
             const request = params.request || {};
             const requestMethod = String(request.method || "");
             const url = String(request.url || "");
+            const postData = String(request.postData || "");
+            if (/UploadFileSuccess/.test(postData) && /videoFileType/.test(postData)) {
+              this.weixinUploadFailures.delete(wc.id);
+              this.weixinRemoteUploadAt.set(wc.id, Date.now());
+            }
             if (requestMethod && requestMethod !== "GET") {
               const relevant =
                 /(?:post|publish|create|finderassistant|finderassistance|mmfinderassistant|cgi-bin)/i.test(
@@ -538,11 +545,14 @@ export class BrowserManager {
         await writeBrowserLog(
           "weixin-file-inputs " + JSON.stringify(inputs).slice(0, 10000),
         );
-        await this.chooseFileFromInput(
-          wc,
-          videoInput.nodeId,
-          draft.mediaPaths[0],
-        );
+        // Weixin's uploader may render a transparent drop zone whose click
+        // does not open a native chooser in a background window. Binding the
+        // file directly to the actual input is deterministic and still
+        // dispatches the platform's normal change event below.
+        await this.setFileInput(wc, videoInput.nodeId, [draft.mediaPaths[0]]);
+        await wc.executeJavaScript(
+          "(()=>{for(const input of document.querySelectorAll('input[type=file]')){input.dispatchEvent(new Event('change',{bubbles:true}));input.dispatchEvent(new Event('input',{bubbles:true}))}return true})()",
+        ).catch(() => undefined);
         videoNodeId = videoInput.nodeId;
       } else {
         const inputs = await this.waitForFileInputs(wc, 60000);
@@ -597,6 +607,14 @@ export class BrowserManager {
       if (account.platform !== "douyin")
         await this.fillContent(wc, draft, account.platform);
       if (account.platform === "bilibili") {
+        await wc.executeJavaScript(
+          "window.scrollTo(0,document.documentElement.scrollHeight);true",
+        ).catch(() => undefined);
+        // The declaration control is mounted lazily after the editor settles.
+        // Open its visible label first so the input exists before scanning the
+        // flattened CDP document.
+        await this.clickSmallestByText(wc, "含AI生成内容").catch(() => false);
+        await sleep(1200);
         if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
         await wc.debugger.sendCommand("DOM.enable");
         const flat = await wc.debugger.sendCommand("DOM.getFlattenedDocument", {
@@ -648,7 +666,7 @@ export class BrowserManager {
         }
         const declarationPlaceholder =
           "\u8bf7\u9009\u62e9\u7b26\u5408\u60a8\u89c6\u9891\u5185\u5bb9\u7684\u521b\u4f5c\u58f0\u660e";
-        const declarationDom = await wc.debugger.sendCommand(
+        let declarationDom = await wc.debugger.sendCommand(
           "DOM.getFlattenedDocument",
           { depth: -1, pierce: true },
         );
@@ -662,14 +680,17 @@ export class BrowserManager {
         const declarationMap = new Map(
           declarationAll.map((node) => [node.nodeId, node]),
         );
-        const declarationInputs = [] as Array<{
+        let declarationInputs = [] as Array<{
           nodeId: number;
           backendNodeId: number;
           x: number;
           y: number;
           area: number;
         }>;
-        for (const node of declarationAll.filter(
+        const collectDeclarationInputs = async (all: typeof declarationAll) => {
+        const map = new Map(all.map((node) => [node.nodeId, node]));
+        const collected = [] as typeof declarationInputs;
+        for (const node of all.filter(
           (node) => node.nodeName === "INPUT",
         )) {
           const attrs = node.attributes || [];
@@ -684,7 +705,7 @@ export class BrowserManager {
             current && depth < 8;
             depth++,
               current = current.parentId
-                ? declarationMap.get(current.parentId)
+                ? map.get(current.parentId)
                 : undefined
           ) {
             const joined = (current.attributes || []).join(" ");
@@ -703,7 +724,7 @@ export class BrowserManager {
               width = Math.max(...xs) - Math.min(...xs),
               height = Math.max(...ys) - Math.min(...ys);
             if (width > 10 && height > 10)
-              declarationInputs.push({
+              collected.push({
                 nodeId: node.nodeId,
                 backendNodeId: node.backendNodeId || node.nodeId,
                 x: xs.reduce((sum, value) => sum + value, 0) / 4,
@@ -711,6 +732,19 @@ export class BrowserManager {
                 area: width * height,
               });
           } catch {}
+        }
+        return collected;
+        };
+        declarationInputs = await collectDeclarationInputs(declarationAll);
+        for (let attempt = 0; !declarationInputs.length && attempt < 12; attempt++) {
+          await sleep(800);
+          declarationDom = await wc.debugger.sendCommand(
+            "DOM.getFlattenedDocument",
+            { depth: -1, pierce: true },
+          );
+          declarationInputs = await collectDeclarationInputs(
+            declarationDom.nodes as typeof declarationAll,
+          );
         }
         declarationInputs.sort((a, b) => b.area - a.area);
         const declarationInput = declarationInputs[0];
@@ -1252,14 +1286,46 @@ export class BrowserManager {
       }
       await progress("uploading", "视频上传中，等待平台处理");
       const publishTimeout = publishUploadTimeout(account.platform);
-      const ready =
-        account.platform === "xiaohongshu"
-          ? await this.waitForXhsPublishReady(wc, publishTimeout)
-          : await this.waitForPublishReady(
+      let ready = false;
+      if (account.platform === "weixin") {
+        for (let attempt = 1; attempt <= 3 && !ready; attempt++) {
+          try {
+            ready = await this.waitForPublishReady(
               wc,
               account.platform,
               publishTimeout,
             );
+          } catch (error) {
+            if (
+              attempt >= 3 ||
+              !/视频号视频分片上传连接失败/.test(String(error))
+            )
+              throw error;
+            await progress(
+              "uploading",
+              `视频号上传连接失败，正在自动重试（${attempt}/2）`,
+            );
+            this.weixinUploadFailures.delete(wc.id);
+            this.weixinRemoteUploadAt.delete(wc.id);
+            const retryInputs = await this.waitForFileInputs(wc, 20000);
+            const retryInput =
+              retryInputs.find((input) => /video/i.test(input.accept)) ||
+              retryInputs[0];
+            if (!retryInput) throw new Error("视频号重试时未找到上传控件");
+            await this.setFileInput(wc, retryInput.nodeId, [videoPath]);
+            await sleep(1500);
+          }
+        }
+      } else {
+        ready =
+          account.platform === "xiaohongshu"
+            ? await this.waitForXhsPublishReady(wc, publishTimeout)
+            : await this.waitForPublishReady(
+                wc,
+                account.platform,
+                publishTimeout,
+              );
+      }
       if (!ready) {
         const douyinDiagnostics =
           account.platform === "douyin"
