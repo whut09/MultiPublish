@@ -181,6 +181,7 @@ async function runPublishSelfTest() {
       draft,
       async (status, message) => {
         progress.push({ status, message, at: new Date().toISOString() });
+        console.log("publish-self-test", platform, status, message);
       },
     );
     await fs.writeFile(

@@ -9,6 +9,7 @@ import type {
   TaskStatus,
 } from "../shared/types";
 import { platformMap } from "../shared/platforms";
+import { backendTitleCandidates, publishUploadTimeout } from "./publish-verification";
 type AccountUpdate = { name?: string; loginStatus?: LoginStatus };
 type PublishProgress = (status: TaskStatus, message: string) => Promise<void>;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -24,7 +25,7 @@ const writeBrowserLog = async (message: string) => {
 const redactWeixinDiagnostic = (value: unknown, limit = 16000) =>
   String(value ?? "")
     .replace(
-      /((?:cookie|sessionid|token|findertoken|encfilekey)["']?\s*[:=]\s*["']?)[^"'&\s,}]+/gi,
+      /((?:cookie|sessionid|token|findertoken|encfilekey|authkey)["']?\s*[:=]\s*["']?)[^"'&\s,}]+/gi,
       "$1[redacted]",
     )
     .replace(/([?&](?:token|findertoken|encfilekey)=)[^&\s]+/gi, "$1[redacted]")
@@ -62,6 +63,7 @@ export class BrowserManager {
   private inspectVersions = new Map<string, number>();
   private sessionFlushes = new Map<string, Promise<void>>();
   private weixinRemoteUploadAt = new Map<number, number>();
+  private weixinUploadFailures = new Map<number, string>();
   private weixinPublishPoints = new Map<number, { x: number; y: number }>();
   private weixinPostCreateResults = new Map<
     number,
@@ -212,7 +214,6 @@ export class BrowserManager {
         status: "failed" as const,
         message: "视频文件不存在或为空：" + videoPath,
       };
-    const requiresVisibleWindow = false;
     const automationWindow = new BrowserWindow({
       show: false,
       skipTaskbar: true,
@@ -231,6 +232,9 @@ export class BrowserManager {
       },
     });
     automationWindow.setOpacity(0.01);
+    // Keep Chromium rendering without bringing an off-screen publisher to the
+    // foreground. Fully hidden windows can stall platform upload processing.
+    automationWindow.showInactive();
     const wc = automationWindow.webContents;
     wc.setUserAgent(chromeUserAgent);
     wc.setAudioMuted(true);
@@ -263,6 +267,7 @@ export class BrowserManager {
         });
       if (account.platform === "weixin") {
         this.weixinRemoteUploadAt.delete(wc.id);
+        this.weixinUploadFailures.delete(wc.id);
         this.weixinPublishPoints.delete(wc.id);
         this.weixinPostListTitles.delete(wc.id);
         if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
@@ -282,6 +287,12 @@ export class BrowserManager {
             const args = (params.args || []).map((arg: any) =>
               arg.value !== undefined ? arg.value : arg.description,
             );
+            if (params.type === "error" && args.some((value: unknown) =>
+              typeof value === "string" && /uploadpartdfs/.test(value) &&
+              /connect timeout|upload.*fail|network error/i.test(value),
+            )) {
+              this.weixinUploadFailures.set(wc.id, "视频号视频分片上传连接失败，请检查系统代理或网络连接");
+            }
             if (
               args.some(
                 (value: unknown) =>
@@ -308,7 +319,7 @@ export class BrowserManager {
             const url = String(request.url || "");
             if (requestMethod && requestMethod !== "GET") {
               const relevant =
-                /(?:post|publish|create|finderassistant|mmfinderassistant|cgi-bin)/i.test(
+                /(?:post|publish|create|finderassistant|finderassistance|mmfinderassistant|cgi-bin)/i.test(
                   url,
                 );
               if (relevant)
@@ -321,7 +332,9 @@ export class BrowserManager {
                 method: requestMethod,
                 url: redactWeixinDiagnostic(url, 4000),
                 relevant,
-                postData: redactWeixinDiagnostic(request.postData),
+                postData: /\/uploadpartdfs(?:\?|$)/.test(url)
+                  ? undefined
+                  : redactWeixinDiagnostic(request.postData),
               };
             }
           } else if (
@@ -469,10 +482,10 @@ export class BrowserManager {
         ...(initialLogin.name ? { name: initialLogin.name } : {}),
       });
       if (
-        account.platform === "weixin" &&
+        (account.platform === "weixin" || account.platform === "bilibili") &&
         process.env.MULTIPUBLISH_PUBLISH_SELF_TEST_DRAFT_ID === draft.id
       ) {
-        await progress("opening", "正在检查视频号后台，防止重复发布");
+        await progress("opening", "正在检查平台后台，防止重复发布");
         const existing = await this.verifyPublishedTitle(
           wc,
           account.platform,
@@ -482,7 +495,9 @@ export class BrowserManager {
         if (existing.ok)
           return {
             status: "success" as const,
-            message: "视频号后台已存在目标标题，未重复发布",
+            message:
+              platformMap[account.platform].name + "后台已存在完整目标标题：" +
+              draft.title + "，未重复发布",
           };
         await wc
           .loadURL(platformMap[account.platform].publishUrl)
@@ -758,7 +773,7 @@ export class BrowserManager {
           clickCount: 1,
         });
         await sleep(900);
-        const declarationClick = await this.clickSmallestByText(
+        let declarationClick = await this.clickSmallestByText(
           wc,
           "\u542bAI\u751f\u6210\u5185\u5bb9",
         );
@@ -778,6 +793,37 @@ export class BrowserManager {
             },
           );
           declarationValue = valueResult.result?.value || "";
+        }
+        if (!declarationValue) {
+          declarationClick = await this.clickButtonByText(
+            wc,
+            ["含AI生成内容"],
+            false,
+          );
+          await sleep(1000);
+          const refreshed = await wc.debugger.sendCommand(
+            "DOM.getFlattenedDocument",
+            { depth: -1, pierce: true },
+          );
+          for (const node of refreshed.nodes as typeof declarationAll) {
+            if (node.nodeName !== "INPUT") continue;
+            const attrs = node.attributes || [];
+            if (!attrs.includes(declarationPlaceholder)) continue;
+            const resolved = await wc.debugger.sendCommand("DOM.resolveNode", {
+              backendNodeId: node.backendNodeId || node.nodeId,
+            });
+            if (!resolved.object?.objectId) continue;
+            const state = await wc.debugger.sendCommand("Runtime.callFunctionOn", {
+              objectId: resolved.object.objectId,
+              functionDeclaration: 'function(){return{value:this.value||"",visible:this.getClientRects().length>0,context:(this.parentElement?.innerText||"").slice(0,1200)}}',
+              returnByValue: true,
+            });
+            await writeBrowserLog("bilibili-declaration-state " + JSON.stringify(state.result?.value));
+            if (state.result?.value?.visible && state.result.value.value) {
+              declarationValue = state.result.value.value;
+              break;
+            }
+          }
         }
         if (!declarationClick || !declarationValue)
           throw new Error(
@@ -1205,10 +1251,7 @@ export class BrowserManager {
         }
       }
       await progress("uploading", "视频上传中，等待平台处理");
-      const publishTimeout =
-        account.platform === "douyin" || account.platform === "toutiao"
-          ? 600000
-          : 180000;
+      const publishTimeout = publishUploadTimeout(account.platform);
       const ready =
         account.platform === "xiaohongshu"
           ? await this.waitForXhsPublishReady(wc, publishTimeout)
@@ -1535,6 +1578,7 @@ export class BrowserManager {
       };
     } finally {
       this.weixinRemoteUploadAt.delete(wc.id);
+      this.weixinUploadFailures.delete(wc.id);
       this.weixinPublishPoints.delete(wc.id);
       this.weixinPostCreateResults.delete(wc.id);
       this.weixinPostListTitles.delete(wc.id);
@@ -1639,6 +1683,8 @@ export class BrowserManager {
         if (ready) return true;
       }
       if (platform === "weixin") {
+        const uploadFailure = this.weixinUploadFailures.get(wc.id);
+        if (uploadFailure) throw new Error(uploadFailure);
         const ready = await wc.executeJavaScript(
           "(()=>{const visible=e=>!!e&&e.offsetParent!==null;const all=root=>{const result=[];for(const e of root.querySelectorAll('*')){result.push(e);if(e.shadowRoot)result.push(...all(e.shadowRoot))}return result};const nodes=all(document);const fields=nodes.filter(e=>visible(e)&&(e.matches?.('input,textarea,[contenteditable=true]')||e.getAttribute?.('contenteditable')==='true'));const text=(document.body?.innerText||'')+' '+nodes.map(e=>(e.textContent||'').trim()).join(' ');const login=/扫码登录|手机号登录|验证码登录|APP扫一扫登录/.test(text);const editor=/视频描述|作品描述|发表视频|声明原创|原创声明|封面|发布设置|添加话题/.test(text);const uploadError=/上传失败|上传出错|视频格式不支持|文件损坏/.test(text);return{ok:/channels\\.weixin\\.qq\\.com\\/platform/.test(location.href)&&!login&&!uploadError&&fields.length>0&&editor,url:location.href,fields:fields.length,editor,uploadError,login,text:text.slice(-1800)}})()",
         );
@@ -2849,12 +2895,23 @@ export class BrowserManager {
     const start = Date.now();
     let lastDiagnosticAt = 0;
     while (Date.now() - start < timeout) {
+      if (wc.isDestroyed()) throw new Error("发布窗口已关闭");
+      const uploadFailure = this.weixinUploadFailures.get(wc.id);
+      if (platform === "weixin" && uploadFailure) throw new Error(uploadFailure);
       if (platform === "weixin") {
         const remoteUploadAt = this.weixinRemoteUploadAt.get(wc.id) || 0;
         const remoteUploadAge = remoteUploadAt
           ? Date.now() - remoteUploadAt
           : 0;
         if (!remoteUploadAt || remoteUploadAge < 8000) {
+          if (Date.now() - lastDiagnosticAt >= 10000) {
+            lastDiagnosticAt = Date.now();
+            await writeBrowserLog(
+              "weixin-upload-wait " + JSON.stringify({
+                elapsed: Date.now() - start, remoteUploadAt, remoteUploadAge,
+              }),
+            );
+          }
           await sleep(1000);
           continue;
         }
@@ -2883,11 +2940,7 @@ export class BrowserManager {
               result.set(attributes[index], attributes[index + 1] || "");
             return result;
           };
-          const text =
-            nodes.map((node) => node.nodeValue || "").join(" ") +
-            " " +
-            nodes.map((node) => (node.attributes || []).join(" ")).join(" ");
-          const uploading = /上传中|正在上传|转码中|上传进度|处理中/.test(text);
+          let text = "";
           let publish = false;
           let publishNodeId = 0;
           let publishButton = "";
@@ -2915,8 +2968,26 @@ export class BrowserManager {
                   ariaDisabled: attributes.get("aria-disabled"),
                 });
                 if (enabled) {
-                  publish = true;
-                  publishNodeId = current.nodeId;
+                  const resolved = await wc.debugger.sendCommand("DOM.resolveNode", {
+                    nodeId: current.nodeId,
+                  });
+                  const objectId = resolved.object?.objectId;
+                  if (objectId) {
+                    try {
+                      const state = await wc.debugger.sendCommand("Runtime.callFunctionOn", {
+                        objectId,
+                        functionDeclaration: 'function(){return{visible:this.getClientRects().length>0&&getComputedStyle(this).visibility!=="hidden",text:this.ownerDocument.body?.innerText||""}}',
+                        returnByValue: true,
+                      });
+                      if (state.result?.value?.visible) {
+                        text = state.result.value.text;
+                        publish = true;
+                        publishNodeId = current.nodeId;
+                      }
+                    } finally {
+                      await wc.debugger.sendCommand("Runtime.releaseObject", { objectId }).catch(() => undefined);
+                    }
+                  }
                 }
                 break;
               }
@@ -2946,6 +3017,7 @@ export class BrowserManager {
               ),
             });
           }
+          const uploading = /上传中|正在上传|转码中|上传进度|处理中/.test(text);
           const uploaded = true;
           if (Date.now() - lastDiagnosticAt >= 10000) {
             lastDiagnosticAt = Date.now();
@@ -2968,7 +3040,9 @@ export class BrowserManager {
             this.weixinPublishPoints.has(wc.id)
           )
             return true;
-        } catch {}
+        } catch (error) {
+          await writeBrowserLog("weixin-publish-ready-error " + String(error));
+        }
         await sleep(1500);
         continue;
       }
@@ -3044,13 +3118,8 @@ export class BrowserManager {
         .toLowerCase()
         .replace(/[^\p{L}\p{N}]+/gu, "");
     const normalizedTitle = normalize(platformTitle);
-    const expected = [
-      normalizedTitle,
-      normalizedTitle.slice(0, 24),
-      normalizedTitle.slice(0, 20),
-      normalizedTitle.slice(0, 16),
-      normalizedTitle.slice(0, 12),
-    ].filter((value) => value.length >= 2);
+    const rawExpected = backendTitleCandidates(platform, platformTitle);
+    const expected = rawExpected.map(normalize).filter((value) => value.length >= 2);
     const start = Date.now();
     let lastUrl = "";
     while (Date.now() - start < timeout) {
@@ -3099,8 +3168,12 @@ export class BrowserManager {
                 titles: exactEvidence.slice(0, 80),
               }).slice(0, 12000),
           );
-          if (exactEvidence.some((value: unknown) => value === title))
+          if (exactEvidence.some((value: unknown) => value === title)) {
+            await writeBrowserLog("backend-title-verified " + JSON.stringify({
+              platform, title, url: wc.getURL(), source: "post_list",
+            }));
             return { ok: true, url: wc.getURL() };
+          }
         }
         const snapshot = await wc
           .executeJavaScript(
@@ -3114,24 +3187,19 @@ export class BrowserManager {
             url: snapshot.url,
             reason: platformMap[platform].name + "作品管理要求重新登录",
           };
-        const rawExpected =
-          platform === "weixin"
-            ? [platformTitle]
-            : [
-                platformTitle,
-                Array.from(platformTitle).slice(0, 24).join(""),
-                Array.from(platformTitle).slice(0, 20).join(""),
-                Array.from(platformTitle).slice(0, 16).join(""),
-                Array.from(platformTitle).slice(0, 12).join(""),
-              ].filter((value) => value.length >= 2);
         const normalizedText = normalize(snapshot.text);
         if (
           rawExpected.some((value) => snapshot.text.includes(value)) ||
           (platform === "weixin"
             ? normalizedText.includes(normalizedTitle)
             : expected.some((value) => normalizedText.includes(value)))
-        )
+        ) {
+          await writeBrowserLog("backend-title-verified " + JSON.stringify({
+            platform, title: platformTitle, url: snapshot.url,
+            source: "manager-dom", text: snapshot.text.slice(0, 16000),
+          }));
           return { ok: true, url: snapshot.url };
+        }
         await sleep(3000);
       }
     }
