@@ -69,6 +69,7 @@ export class BrowserManager {
     number,
     { ok: boolean; errCode?: number; body: string }
   >();
+  private weixinPostCreateRequested = new Set<number>();
   private weixinPostListTitles = new Map<number, string[]>();
   private active?: string;
   private bounds: BrowserBounds = { x: 280, y: 160, width: 900, height: 650 };
@@ -269,6 +270,7 @@ export class BrowserManager {
         this.weixinRemoteUploadAt.delete(wc.id);
         this.weixinUploadFailures.delete(wc.id);
         this.weixinPublishPoints.delete(wc.id);
+        this.weixinPostCreateRequested.delete(wc.id);
         this.weixinPostListTitles.delete(wc.id);
         if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
         await Promise.all([
@@ -320,6 +322,8 @@ export class BrowserManager {
             const requestMethod = String(request.method || "");
             const url = String(request.url || "");
             const postData = String(request.postData || "");
+            if (/\/post\/post_create(?:\?|$)/.test(url))
+              this.weixinPostCreateRequested.add(wc.id);
             if (/UploadFileSuccess/.test(postData) && /videoFileType/.test(postData)) {
               this.weixinUploadFailures.delete(wc.id);
               this.weixinRemoteUploadAt.set(wc.id, Date.now());
@@ -748,8 +752,11 @@ export class BrowserManager {
         }
         declarationInputs.sort((a, b) => b.area - a.area);
         const declarationInput = declarationInputs[0];
-        if (!declarationInput)
-          throw new Error("Bilibili visible declaration input not found");
+        if (!declarationInput) {
+          await writeBrowserLog(
+            "bilibili declaration input not found; continuing with platform default",
+          );
+        } else {
         const declarationResolvedBefore = await wc.debugger.sendCommand(
           "DOM.resolveNode",
           { backendNodeId: declarationInput.backendNodeId },
@@ -860,14 +867,15 @@ export class BrowserManager {
           }
         }
         if (!declarationClick || !declarationValue)
-          throw new Error(
-            "Bilibili declaration selection failed: " +
+          await writeBrowserLog(
+            "bilibili declaration selection unavailable; continuing with platform default " +
               JSON.stringify({
                 declarationClick,
                 declarationValue,
                 declarationInput: { x: declarationX, y: declarationY },
               }),
           );
+        }
         wc.sendInputEvent({ type: "mouseMove", x: 680, y: 785 });
         wc.sendInputEvent({
           type: "mouseDown",
@@ -906,17 +914,19 @@ export class BrowserManager {
             45000,
           );
           if (!coverUploaded)
-            throw new Error(
-              "Bilibili cover upload control not found after retries",
+            await writeBrowserLog(
+              "bilibili cover upload unavailable; continuing with platform default",
             );
-          await sleep(2200);
-          await this.waitAndClickButton(
-            wc,
-            ["确定", "保存", "完成", "应用"],
-            15000,
-            true,
-          );
-          await sleep(1000);
+          else {
+            await sleep(2200);
+            await this.waitAndClickButton(
+              wc,
+              ["确定", "保存", "完成", "应用"],
+              15000,
+              true,
+            );
+            await sleep(1000);
+          }
         }
       }
       if (account.platform === "douyin") {
@@ -1320,11 +1330,13 @@ export class BrowserManager {
         ready =
           account.platform === "xiaohongshu"
             ? await this.waitForXhsPublishReady(wc, publishTimeout)
-            : await this.waitForPublishReady(
-                wc,
-                account.platform,
-                publishTimeout,
-              );
+            : account.platform === "bilibili"
+              ? await this.waitForBilibiliPublishReady(wc, publishTimeout)
+              : await this.waitForPublishReady(
+                  wc,
+                  account.platform,
+                  publishTimeout,
+                );
       }
       if (!ready) {
         const douyinDiagnostics =
@@ -1353,6 +1365,22 @@ export class BrowserManager {
           "window.scrollTo(0,document.documentElement.scrollHeight);true",
         );
         await sleep(1200);
+      }
+      if (account.platform === "weixin") {
+        // Install the request patch before the trusted mouse event. The page
+        // builds post_create asynchronously after the click, so installing it
+        // afterwards races the platform and can leave the editor unchanged.
+        const titlePatch =
+          "((fullTitle)=>{try{if(window.__multipublishPostPatch)return true;const shortTitle=Array.from(fullTitle).slice(0,12).join('');const patchBody=body=>{if(typeof body!=='string')return body;try{const data=JSON.parse(body);if(data?.objectDesc){data.objectDesc.mpTitle=shortTitle;data.objectDesc.shortTitle=[{shortTitle}];}return JSON.stringify(data)}catch{return body}};const fetch0=window.fetch;window.fetch=(input,init)=>{const url=typeof input==='string'?input:input?.url||'';if(/post\\/post_create/.test(url)&&init?.body)init={...init,body:patchBody(init.body)};return fetch0.call(window,input,init)};const open0=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(method,url){this.__multipublishUrl=String(url);return open0.apply(this,arguments)};const send0=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.send=function(body){if(/post\\/post_create/.test(this.__multipublishUrl||''))body=patchBody(body);return send0.call(this,body)};window.__multipublishPostPatch=true;return true}catch(error){return String(error)}})(" +
+          JSON.stringify(draft.title) +
+          ")";
+        const frames = [wc.mainFrame, ...wc.mainFrame.framesInSubtree];
+        await Promise.all(
+          frames.map((frame) => frame.executeJavaScript(titlePatch).catch(() => undefined)),
+        );
+        await writeBrowserLog(
+          "weixin-post-request-patch frames=" + String(frames.length),
+        );
       }
       await progress("publishing", "正在提交发布");
       let clicked = false,
@@ -1525,6 +1553,21 @@ export class BrowserManager {
         );
       }
       if (!clicked) throw new Error("没有找到可用的发布按钮");
+      if (account.platform === "weixin") {
+        // A stale coordinate can hit the editor after a late layout shift. If
+        // no submit request or navigation appears, reacquire the live button
+        // and issue one trusted retry instead of declaring success.
+        await sleep(6000);
+        if (!this.weixinPostCreateRequested.has(wc.id) && /platform\/post\/create/.test(wc.getURL())) {
+          await writeBrowserLog("weixin-publish-retry reason=no-post-create");
+          await this.clickButtonByText(
+            wc,
+            ["发布", "发表"],
+            true,
+            true,
+          );
+        }
+      }
       if (account.platform === "toutiao") {
         await sleep(5000);
         const current = await wc.getURL();
@@ -1551,19 +1594,6 @@ export class BrowserManager {
           );
           if (confirmed) break;
         }
-      }
-      if (account.platform === "weixin") {
-        const titlePatch =
-            "((fullTitle)=>{try{if(window.__multipublishPostPatch)return true;const shortTitle=Array.from(fullTitle).slice(0,12).join('');const patchBody=body=>{if(typeof body!=='string')return body;try{const data=JSON.parse(body);if(data?.objectDesc){data.objectDesc.mpTitle=shortTitle;data.objectDesc.shortTitle=[{shortTitle}];}return JSON.stringify(data)}catch{return body}};const fetch0=window.fetch;window.fetch=(input,init)=>{const url=typeof input==='string'?input:input?.url||'';if(/post\\/post_create/.test(url)&&init?.body)init={...init,body:patchBody(init.body)};return fetch0.call(window,input,init)};const open0=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(method,url){this.__multipublishUrl=String(url);return open0.apply(this,arguments)};const send0=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.send=function(body){if(/post\\/post_create/.test(this.__multipublishUrl||''))body=patchBody(body);return send0.call(this,body)};window.__multipublishPostPatch=true;return true}catch(error){return String(error)}})(" +
-          JSON.stringify(draft.title) +
-          ")";
-        const frames = [wc.mainFrame, ...wc.mainFrame.framesInSubtree];
-        await Promise.all(
-          frames.map((frame) => frame.executeJavaScript(titlePatch).catch(() => undefined)),
-        );
-        await writeBrowserLog(
-          "weixin-post-request-patch frames=" + String(frames.length),
-        );
       }
       const result = await this.waitForResult(
         wc,
@@ -1647,6 +1677,7 @@ export class BrowserManager {
       this.weixinUploadFailures.delete(wc.id);
       this.weixinPublishPoints.delete(wc.id);
       this.weixinPostCreateResults.delete(wc.id);
+      this.weixinPostCreateRequested.delete(wc.id);
       this.weixinPostListTitles.delete(wc.id);
       if (weixinDiagnosticListener)
         wc.debugger.removeListener("message", weixinDiagnosticListener);
@@ -2042,18 +2073,59 @@ export class BrowserManager {
     const weixinPoint = this.weixinPublishPoints.get(wc.id);
     if (
       trustedOnly &&
-      weixinPoint &&
       texts.some((text) => /发布|发表/.test(text))
     ) {
+      // 视频号编辑器由 Wujie 挂载在子 frame 中。主文档坐标有时只命中
+      // 宿主包装层，因此先在每个实际 frame 内触发对应按钮。
+      const frameClicks = await Promise.all(
+        [wc.mainFrame, ...wc.mainFrame.framesInSubtree].map((frame) =>
+          frame
+            .executeJavaScript(
+              "((texts,preferBottom)=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const result=[];for(const e of root.querySelectorAll('*')){result.push(e);if(e.shadowRoot)result.push(...all(e.shadowRoot))}return result};const c=all(document).filter(e=>e.matches?.('button,[role=button]')&&visible(e)&&texts.includes((e.textContent||'').trim())&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&!String(e.className||'').includes('disabled'));c.sort((a,b)=>(preferBottom?b.getBoundingClientRect().bottom-a.getBoundingClientRect().bottom:a.getBoundingClientRect().bottom-b.getBoundingClientRect().bottom));const e=c[0];if(!e)return{clicked:false};e.scrollIntoView({block:'center'});e.focus?.();e.click();return{clicked:true,text:(e.textContent||'').trim(),url:location.href}})(" +
+                JSON.stringify(texts) +
+                "," +
+                JSON.stringify(preferBottom) +
+                ")",
+            )
+            .then((value) => ({ frame: frame.url, value }))
+            .catch(() => ({ frame: frame.url, value: { clicked: false } })),
+        ),
+      );
+      const clickedInFrame = frameClicks.filter(
+        (item) => (item.value as { clicked?: boolean } | undefined)?.clicked,
+      );
+      if (clickedInFrame.length) {
+        await writeBrowserLog(
+          "weixin-publish-dom-click " +
+            JSON.stringify(clickedInFrame).slice(0, 12000),
+        );
+        await sleep(1200);
+        if (this.weixinPostCreateRequested.has(wc.id)) return true;
+      }
+      // Re-read the button immediately before dispatching the trusted event.
+      // The editor can reflow after upload processing, making the point saved
+      // by waitForPublishReady stale even though the button is still enabled.
+      const livePoint = await wc
+        .executeJavaScript(
+          "((texts,preferBottom)=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const result=[];for(const e of root.querySelectorAll('*')){result.push(e);if(e.shadowRoot)result.push(...all(e.shadowRoot))}return result};const candidates=all(document).filter(e=>e.matches?.('button,[role=button]')&&visible(e)&&texts.includes((e.textContent||'').trim())&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&!String(e.className||'').includes('disabled')).map(e=>{const r=e.getBoundingClientRect();return{x:r.left+r.width/2,y:r.top+r.height/2,area:r.width*r.height,bottom:r.bottom}}).sort((a,b)=>(preferBottom?b.bottom-a.bottom:a.bottom-b.bottom)||a.area-b.area);return candidates[0]||null})(" +
+            JSON.stringify(texts) +
+            "," +
+            JSON.stringify(preferBottom) +
+            ")",
+        )
+        .catch(() => null);
+      const point = livePoint || weixinPoint;
+      if (!point) return false;
+      this.weixinPublishPoints.set(wc.id, { x: point.x, y: point.y });
       await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
         type: "mouseMoved",
-        x: weixinPoint.x,
-        y: weixinPoint.y,
+        x: point.x,
+        y: point.y,
       });
       await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
         type: "mousePressed",
-        x: weixinPoint.x,
-        y: weixinPoint.y,
+        x: point.x,
+        y: point.y,
         button: "left",
         buttons: 1,
         clickCount: 1,
@@ -2061,14 +2133,14 @@ export class BrowserManager {
       await sleep(120);
       await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
         type: "mouseReleased",
-        x: weixinPoint.x,
-        y: weixinPoint.y,
+        x: point.x,
+        y: point.y,
         button: "left",
         buttons: 0,
         clickCount: 1,
       });
       await writeBrowserLog(
-        "weixin-publish-click " + JSON.stringify(weixinPoint),
+        "weixin-publish-click " + JSON.stringify(point),
       );
       return true;
     }
@@ -2893,36 +2965,18 @@ export class BrowserManager {
       });
       const titleNode = titleNodes.at(-1);
       if (titleNode?.backendNodeId) {
-        await wc.debugger.sendCommand("DOM.focus", {
+        const resolved = await wc.debugger.sendCommand("DOM.resolveNode", {
           backendNodeId: titleNode.backendNodeId,
         });
-        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
-          type: "rawKeyDown",
-          key: "a",
-          code: "KeyA",
-          windowsVirtualKeyCode: 65,
-          modifiers: 2,
-        });
-        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
-          type: "keyDown",
-          key: "Backspace",
-          code: "Backspace",
-          windowsVirtualKeyCode: 8,
-        });
-        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
-          type: "keyUp",
-          key: "Backspace",
-          code: "Backspace",
-          windowsVirtualKeyCode: 8,
-        });
-        await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
-          type: "keyUp",
-          key: "a",
-          code: "KeyA",
-          windowsVirtualKeyCode: 65,
-          modifiers: 2,
-        });
-        await wc.debugger.sendCommand("Input.insertText", { text: title });
+        const objectId = resolved.object?.objectId;
+        if (objectId)
+          await wc.debugger.sendCommand("Runtime.callFunctionOn", {
+            objectId,
+            functionDeclaration:
+              'function(value){const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value")?.set;setter?setter.call(this,value):this.value=value;this.dispatchEvent(new InputEvent("input",{bubbles:true,inputType:"insertText",data:value}));this.dispatchEvent(new Event("change",{bubbles:true}));this.dispatchEvent(new Event("blur",{bubbles:true}));return this.value}',
+            arguments: [{ value: title }],
+            returnByValue: true,
+          });
         await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
           type: "keyDown",
           key: "Tab",
@@ -2939,7 +2993,9 @@ export class BrowserManager {
       }
       const titleState = await wc
         .executeJavaScript(
-          "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const e=[...document.querySelectorAll('input')].find(e=>visible(e)&&/0[～-]30|标题/.test(e.placeholder||''));return{value:e?.value||'',placeholder:e?.placeholder||''}})()",
+          "((value)=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;const inputs=[...document.querySelectorAll('input')].filter(e=>visible(e)&&/0[～-]30|标题/.test(e.placeholder||''));for(const e of inputs){e.focus();setter?setter.call(e,value):e.value=value;e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));e.blur?.()}return{values:inputs.map(e=>e.value),placeholders:inputs.map(e=>e.placeholder),value:inputs.at(-1)?.value||'',placeholder:inputs.at(-1)?.placeholder||''}})(" +
+            JSON.stringify(title) +
+            ")",
         )
         .catch(() => ({ value: "", placeholder: "" }));
       await writeBrowserLog(
@@ -2952,6 +3008,33 @@ export class BrowserManager {
             JSON.stringify({ titleState, expectedTitle: title }),
         );
     }
+  }
+  private async waitForBilibiliPublishReady(
+    wc: Electron.WebContents,
+    timeout: number,
+  ) {
+    const start = Date.now();
+    let lastDiagnosticAt = 0;
+    while (Date.now() - start < timeout) {
+      const state = await wc
+        .executeJavaScript(
+          "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const result=[];for(const e of root.querySelectorAll('*')){result.push(e);if(e.shadowRoot)result.push(...all(e.shadowRoot))}return result};const nodes=all(document).filter(visible);const buttons=nodes.filter(e=>e.matches?.('button,[role=button],a,div,span')&&/^(立即投稿|投稿|发布)$/.test((e.textContent||'').trim()));const publish=buttons.some(e=>!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&!String(e.className||'').includes('disabled'));const title=nodes.find(e=>e.matches?.('input,textarea,[contenteditable=true]')&&/标题|稿件标题|视频标题/.test(e.getAttribute('placeholder')||''));const titleValue=typeof title?.value==='string'?title.value:(title?.textContent||'');const text=(document.body?.innerText||'').slice(-16000);return{publish,title:!!titleValue.trim(),failed:/上传失败|转码失败|无视频流信息/.test(text),url:location.href,text:text.slice(-2500)}})()",
+        )
+        .catch(() => ({ publish: false, title: false, failed: false, url: wc.getURL(), text: "" }));
+      if (state.failed) throw new Error("B站平台返回视频上传失败");
+      if (Date.now() - lastDiagnosticAt >= 10000) {
+        lastDiagnosticAt = Date.now();
+        await writeBrowserLog(
+          "bilibili-publish-ready-state " + JSON.stringify(state).slice(0, 5000),
+        );
+      }
+      // Bilibili keeps a static “上传进度” label in the editor after the
+      // upload is complete. The actionable submit control is the reliable
+      // readiness signal, so do not gate on that stale label.
+      if (state.publish && state.title) return true;
+      await sleep(1500);
+    }
+    return false;
   }
   private async waitForPublishReady(
     wc: Electron.WebContents,
