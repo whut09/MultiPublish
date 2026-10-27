@@ -3047,9 +3047,11 @@ export class BrowserManager {
       const probe = `(()=>{
         const visible=el=>!!el&&!!el.getClientRects&&el.getClientRects().length>0;
         const patterns=${JSON.stringify(patterns.map((p) => p.source))}.map(s=>new RegExp(s));
-        // 展开折叠区：抖音"作品声明"、小红书"更多设置"等入口
+        // 展开折叠区：只点真正的折叠入口。严禁把目标开关自己的文案
+        // （声明原创/原创声明）当折叠入口——那会先把开关拨乱
+        // （22:53 批次实证：expander 点击与后续点击相互抵消，最终停在未勾选）
         for(const ex of [...document.querySelectorAll('button,div,span,label,a')]
-          .filter(e=>visible(e)&&/^(更多设置|更多选项|高级设置|作品声明|同步发布|同步到|全部设置|声明原创|原创声明)$/.test((e.textContent||'').trim()))
+          .filter(e=>visible(e)&&/^(更多设置|更多选项|高级设置|作品声明|同步发布|同步到|全部设置)$/.test((e.textContent||'').trim()))
           .slice(0,5)){try{(ex.closest('button')||ex).click()}catch{}}
         const isControl=el=>{
           if(!el||el.tagName==='INPUT')return false;
@@ -3174,7 +3176,38 @@ export class BrowserManager {
         .catch(() => undefined)) as
         | { x: number; y: number; w: number; h: number; tag: string }
         | undefined;
+      // 阶段二+三：点击与复验的自纠错循环。平台自绘 switch 对点击方式很
+      // 挑剔：真实鼠标事件、JS click、原生 setter+change 各有生效场景，
+      // 每试一种就读一次真实状态，勾上为止（最多三种策略）。
+      const verifyScript = `(()=>{const el=document.querySelector('[${mark}="1"]');if(!el)return null;
+            const stateOf=el=>{
+              if(el.checked!==undefined)return !!el.checked;
+              const aria=el.getAttribute&&el.getAttribute('aria-checked');
+              if(aria==='true'||aria==='false')return aria==='true';
+              const cls=String(el.className||'');
+              if(/(^|[\\s-])unchecked([\\s-]|$)/i.test(cls))return false;
+              if(/checked|switched|is-on|is-active|active|selected|opened/i.test(cls))return true;
+              const inner=el.querySelector&&el.querySelector('[class*=checked]:not([class*=unchecked])');
+              if(inner)return true;
+              return null;
+            };
+            const input=el.matches('input')?el:(el.closest('label')?.querySelector('input[type=checkbox]')||el);
+            return{state:stateOf(el),inputState:stateOf(input),html:(el.outerHTML||'').slice(0,320),cls:String(el.className||'').slice(0,140)};})()`;
+      const readState = async () => {
+        const v = (await frame
+          .executeJavaScript(verifyScript)
+          .catch(() => undefined)) as Record<string, unknown> | undefined;
+        verify = v;
+        const state = (v?.state ?? null) as boolean | null;
+        const inputState = (v?.inputState ?? null) as boolean | null;
+        after = state ?? inputState;
+        return after;
+      };
+      const strategyLog: Array<Record<string, unknown>> = [];
       let clicked = false;
+      let after: boolean | null = null;
+      let verify: Record<string, unknown> | undefined;
+      // 策略1：CDP 真实鼠标事件（trusted 事件，自绘组件的首选）
       if (clickInfo && clickInfo.w > 0 && clickInfo.h > 0) {
         try {
           if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
@@ -3203,7 +3236,11 @@ export class BrowserManager {
           clicked = true;
         } catch {}
       }
-      if (!clicked)
+      await sleep(700);
+      after = await readState();
+      strategyLog.push({ strategy: "cdp-click", clicked, after, cls: verify?.cls });
+      // 策略2：JS click（点击 label 或 input 本体）
+      if (after !== true) {
         clicked = (
           await frame
             .executeJavaScript(
@@ -3214,29 +3251,31 @@ export class BrowserManager {
             )
             .catch(() => false)
         ) === true;
-      await sleep(700);
-      // 阶段三：复验状态
-      const verify = (await frame
-        .executeJavaScript(
-          `(()=>{const el=document.querySelector('[${mark}="1"]');if(!el)return null;
-            const stateOf=el=>{
-              if(el.checked!==undefined)return !!el.checked;
-              const aria=el.getAttribute&&el.getAttribute('aria-checked');
-              if(aria==='true'||aria==='false')return aria==='true';
-              const cls=String(el.className||'');
-              if(/(^|[\s-])unchecked([\s-]|$)/i.test(cls))return false;
-              if(/checked|switched|is-on|is-active|active|selected|opened/i.test(cls))return true;
-              const inner=el.querySelector&&el.querySelector('[class*=checked]:not([class*=unchecked])');
-              if(inner)return true;
-              return null;
-            };
-            const input=el.matches('input')?el:(el.closest('label')?.querySelector('input[type=checkbox]')||el);
-            return{state:stateOf(el),inputState:stateOf(input),html:(el.outerHTML||'').slice(0,320),cls:String(el.className||'').slice(0,140)};})()`,
-        )
-        .catch(() => undefined)) as Record<string, unknown> | undefined;
-      const state = (verify?.state ?? null) as boolean | null;
-      const inputState = (verify?.inputState ?? null) as boolean | null;
-      const after = state ?? inputState;
+        await sleep(700);
+        after = await readState();
+        strategyLog.push({ strategy: "js-click", clicked, after, cls: verify?.cls });
+      }
+      // 策略3：原生 setter + change 事件——React 受控组件的标准驱动方式，
+      // 直接绕过 DOM 点击的事件转发链路
+      if (after !== true) {
+        clicked = (
+          await frame
+            .executeJavaScript(
+              `(()=>{const el=document.querySelector('[${mark}="1"]');if(!el)return false;
+              const input=el.matches('input')?el:(el.querySelector('input[type=checkbox]')||el.closest('label')?.querySelector('input[type=checkbox]'));
+              if(!input)return false;
+              const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'checked').set;
+              setter.call(input,true);
+              input.dispatchEvent(new Event('click',{bubbles:true}));
+              input.dispatchEvent(new Event('change',{bubbles:true}));
+              return true;})()`,
+            )
+            .catch(() => false)
+        ) === true;
+        await sleep(700);
+        after = await readState();
+        strategyLog.push({ strategy: "native-setter", clicked, after, cls: verify?.cls });
+      }
       const record = {
         frame: frame.url ? frame.url.slice(0, 160) : "",
         kind: found.kind,
@@ -3248,7 +3287,8 @@ export class BrowserManager {
         before: found.state ?? null,
         after,
         clicked,
-        stateReadable: state !== null || inputState !== null,
+        stateReadable: after !== null,
+        strategies: strategyLog,
         verifyHtml: verify?.html,
       };
       attemptsLog.push(record);
