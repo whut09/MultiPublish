@@ -1622,6 +1622,45 @@ export class BrowserManager {
             declarationNotes.push(
               "未找到声明原创控件（账号可能无原创声明权益）",
             );
+          if (account.platform === "xiaohongshu") {
+            // 原创声明的权威生效方式：发布请求体注入。2026-10-28 取证：
+            // 手动勾选原创的发布请求 common.business_binds 内含
+            // optionRelationList=[{type:"ORIGINAL_STATEMENT",...}]，而自动
+            // 勾选即使开关 DOM 已 checked，React 受控状态也不进 payload。
+            // 因此拦截 v2/note 请求改写 business_binds（同视频号标题补丁
+            // 模式），不依赖任何 UI 控件。bizId 取自用户手动发布的真实请求。
+            const originalPatch =
+              "((flag)=>{try{if(window.__multipublishOriginalPatch)return 'already';" +
+              "const patchBody=(flag)=>(body)=>{if(!flag||typeof body!=='string')return body;" +
+              "try{const data=JSON.parse(body);const binds=data&&data.common&&data.common.business_binds;" +
+              "if(typeof binds!=='string')return body;const parsed=JSON.parse(binds);" +
+              "if(!Array.isArray(parsed.optionRelationList))parsed.optionRelationList=[];" +
+              "if(!parsed.optionRelationList.some(o=>o&&o.type==='ORIGINAL_STATEMENT')){" +
+              "parsed.optionRelationList.push({type:'ORIGINAL_STATEMENT',relationList:[{bizType:'ORIGINAL_STATEMENT',bizId:'62b2da320000000019022923',extraInfo:'{}'}]})}" +
+              "data.common.business_binds=JSON.stringify(parsed);return JSON.stringify(data)}catch{return body}};" +
+              "const patch=patchBody(flag);" +
+              "const fetch0=window.fetch;window.fetch=(input,init)=>{const url=typeof input==='string'?input:input&&input.url||'';" +
+              "if(/web_api\\/sns\\/v2\\/note(\\?|$)/.test(url)&&init&&typeof init.body==='string')init={...init,body:patch(init.body)};" +
+              "return fetch0.call(window,input,init)};" +
+              "const open0=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(method,url){this.__mpUrl=String(url);return open0.apply(this,arguments)};" +
+              "const send0=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.send=function(body){if(/web_api\\/sns\\/v2\\/note(\\?|$)/.test(this.__mpUrl||''))body=patch(body);return send0.call(this,body)};" +
+              "window.__multipublishOriginalPatch=true;return 'installed'}catch(error){return String(error)}})(true)";
+            const frames = [wc.mainFrame, ...wc.mainFrame.framesInSubtree];
+            const patchResults = await Promise.all(
+              frames.map((frame) =>
+                frame
+                  .executeJavaScript(originalPatch)
+                  .catch((error) => String(error)),
+              ),
+            );
+            await writeBrowserLog(
+              "xhs-original-patch frames=" +
+                frames.length +
+                " " +
+                JSON.stringify(patchResults),
+            );
+            declarationNotes.push("已注入原创声明到发布请求");
+          }
         }
       }
       if (
