@@ -114,6 +114,11 @@ export class BrowserManager {
   private weixinPostCreateRequested = new Set<number>();
   private weixinPostListTitles = new Map<number, string[]>();
   private xhsOrigins = new Map<string, string>();
+  // 小红书可见视图的发布请求探针（按账号记录，避免重复挂载）
+  private xhsViewProbes = new Map<
+    string,
+    (_event: Electron.Event, method: string, params: any) => void
+  >();
   // 自动化发布窗口按账号登记：任务超时/卡死时可以被强制中止并释放。
   private automationWindows = new Map<string, BrowserWindow>();
   private active?: string;
@@ -213,6 +218,29 @@ export class BrowserManager {
   }
   async show(account: Account, target: "home" | "publish" = "home") {
     const view = this.ensureView(account);
+    // 小红书可见视图挂发布请求探针：用户在可见发布页手动发布时，
+    // 抓取带"声明原创"状态的完整请求体，用于确定原创字段的真实名称
+    // （自动勾选已证实 DOM 生效但 React 状态不进 payload，注入方案
+    // 需要先拿到字段名，不能猜）
+    if (
+      account.platform === "xiaohongshu" &&
+      !this.xhsViewProbes.has(account.id)
+    ) {
+      const listener = await this.installPublishRequestProbe(
+        view.webContents,
+        "xiaohongshu-view",
+      );
+      if (listener) {
+        this.xhsViewProbes.set(account.id, listener);
+        view.webContents.once("destroyed", () => {
+          const l = this.xhsViewProbes.get(account.id);
+          if (l) {
+            view.webContents.debugger.removeListener("message", l);
+            this.xhsViewProbes.delete(account.id);
+          }
+        });
+      }
+    }
     if (this.active && this.active !== account.id) {
       const old = this.views.get(this.active);
       if (old) this.win.contentView.removeChildView(old);
