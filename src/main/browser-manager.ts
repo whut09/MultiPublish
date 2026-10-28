@@ -4,7 +4,6 @@ import path from "node:path";
 import type {
   Account,
   BrowserBounds,
-  DouyinSyncTarget,
   LoginStatus,
   PublishDraft,
   TaskStatus,
@@ -1663,43 +1662,9 @@ export class BrowserManager {
           }
         }
       }
-      if (
-        account.platform === "douyin" &&
-        draft.douyinSyncTargets &&
-        draft.douyinSyncTargets.length
-      ) {
-        // 头条不再同步：应用本身直发头条号，同步会造成同一视频重复发布
-        // （2026-10-28 用户确认）。过滤掉旧草稿里残留的 toutiao 目标。
-        const syncTargets = draft.douyinSyncTargets.filter(
-          (target) => target !== "toutiao",
-        );
-        const syncPatterns: Record<DouyinSyncTarget, RegExp> = {
-          // 抖音同步发布的平台名在不同版本有变体："今日头条/头条号"、
-          // "番茄小说/番茄"、"懂车帝"，因此用宽松匹配
-          toutiao: /头条/,
-          fanqie: /番茄/,
-          dongchedi: /懂车帝/,
-        };
-        const syncNames: Record<DouyinSyncTarget, string> = {
-          toutiao: "头条",
-          fanqie: "番茄",
-          dongchedi: "懂车帝",
-        };
-        for (const target of syncTargets) {
-          const result = await this.ensureCheckboxByText(
-            wc,
-            [syncPatterns[target]],
-            "douyin-sync " + target,
-          );
-          declarationNotes.push(
-            result.ok && result.checked
-              ? `已勾选同步到${syncNames[target]}`
-              : result.ok
-                ? `同步到${syncNames[target]}已处于勾选状态`
-                : `未找到同步到${syncNames[target]}的控件`,
-          );
-        }
-      }
+      // 抖音同步发布（头条/番茄/懂车帝）已整体移除（2026-10-28 用户确认）：
+      // 头条由应用直发，同步会重复发布；旧草稿残留的 douyinSyncTargets
+      // 一律忽略，不再执行任何同步勾选。
       if (account.platform === "weixin") {
         // Install the request patch before the trusted mouse event. The page
         // builds post_create asynchronously after the click, so installing it

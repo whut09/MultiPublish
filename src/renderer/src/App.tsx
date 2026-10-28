@@ -36,7 +36,6 @@ import type {
   Account,
   AppData,
   ContentType,
-  DouyinSyncTarget,
   Platform,
   PublishDraft,
   PublishTask,
@@ -44,12 +43,6 @@ import type {
 import { platformMap, platforms } from "../../shared/platforms";
 const { Header, Sider, Content } = Layout;
 type Page = "accounts" | "image" | "video";
-const douyinSyncOptions: { value: DouyinSyncTarget; label: string }[] = [
-  // 头条不提供同步：应用本身直发头条号，同步会造成同一视频重复发布
-  // （2026-10-28 用户确认移除）。番茄/懂车帝保留。
-  { value: "fanqie", label: "番茄" },
-  { value: "dongchedi", label: "懂车帝" },
-];
 const declareOriginalPlatforms: Platform[] = [
   "douyin",
   "xiaohongshu",
@@ -375,9 +368,6 @@ function Publish({
     [tags, setTags] = useState<string[]>([]),
     [tagInput, setTagInput] = useState(""),
     [declareOriginal, setDeclareOriginal] = useState(false),
-    [douyinSyncTargets, setDouyinSyncTargets] = useState<DouyinSyncTarget[]>(
-      douyinSyncOptions.map((option) => option.value),
-    ),
     [form] = Form.useForm();
   const extractCoverWithTimeout = (videoPath: string) =>
     Promise.race([
@@ -434,9 +424,6 @@ function Publish({
         coverPath: cover[0],
         accountIds: value.accountIds,
         declareOriginal: declareOriginal || undefined,
-        douyinSyncTargets: douyinSyncTargets.length
-          ? douyinSyncTargets
-          : undefined,
       });
       hide();
       setData(created);
@@ -710,8 +697,7 @@ function Publish({
                   const showOriginal = declareOriginalPlatforms.some(
                     (platform) => selectedPlatforms.has(platform),
                   );
-                  const showDouyinSync = selectedPlatforms.has("douyin");
-                  if (!showOriginal && !showDouyinSync) return null;
+                  if (!showOriginal) return null;
                   return (
                     <Form.Item label="发布选项">
                       {showOriginal && (
@@ -729,26 +715,6 @@ function Publish({
                             style={{ marginLeft: 8 }}
                           >
                             勾选后在抖音、小红书、视频号发布时自动声明原创
-                          </Typography.Text>
-                        </div>
-                      )}
-                      {showDouyinSync && (
-                        <div style={showOriginal ? { marginTop: 8 } : undefined}>
-                          <span>抖音同步发布到：</span>
-                          <Checkbox.Group
-                            options={douyinSyncOptions}
-                            value={douyinSyncTargets}
-                            onChange={(values) =>
-                              setDouyinSyncTargets(
-                                values as DouyinSyncTarget[],
-                              )
-                            }
-                          />
-                          <Typography.Text
-                            type="secondary"
-                            style={{ marginLeft: 8 }}
-                          >
-                            需在抖音创作者中心绑定对应平台账号
                           </Typography.Text>
                         </div>
                       )}
