@@ -663,18 +663,49 @@ export class BrowserManager {
         ).catch(() => undefined);
         videoNodeId = videoInput.nodeId;
       } else {
+        // 页面是 SPA：publish-loaded 只代表 loadURL 完成，上传控件要等
+        // 前端渲染完才出现（2026-10-28 实证：快手 63 秒、B站 2 秒即报
+        // "找不到上传控件"，均为页面未渲染完）。这里先等控件出现。
         const inputs = await this.waitForFileInputs(wc, 60000);
+        if (!inputs.length) {
+          // 再给一次机会：等待页面出现任何上传相关元素（最多 30 秒）
+          for (let wait = 0; wait < 30; wait += 2) {
+            await sleep(2000);
+            const retryInputs = await this.waitForFileInputs(wc, 1000);
+            if (retryInputs.length) {
+              inputs.push(...retryInputs);
+              break;
+            }
+          }
+        }
         if (!inputs.length && account.platform === "douyin") {
           await this.chooseFileFromButton(wc, "douyin", draft.mediaPaths[0]);
           videoNodeId = -1;
         } else {
           if (!inputs.length) {
             const login = await this.getLoginState(account, wc);
+            if (!login.loggedIn) {
+              return {
+                status: "manual_required" as const,
+                message: "Login required",
+              };
+            }
+            // 上传控件始终未出现：落盘页面快照供取证
+            const snapshot = await wc
+              .executeJavaScript(
+                "(()=>JSON.stringify({url:location.href,title:document.title,body:(document.body?.innerText||'').slice(0,3000)}))()",
+              )
+              .catch(() => "诊断失败");
+            await writeBrowserLog(
+              "upload-control-missing " +
+                account.platform +
+                " " +
+                String(snapshot).slice(0, 3200),
+            );
             return {
               status: "manual_required" as const,
-              message: login.loggedIn
-                ? "Video upload control not found"
-                : "Login required",
+              message:
+                "未找到视频上传控件（页面可能未加载完或已改版，页面快照已记录到日志）",
             };
           }
           const videoInput =
@@ -1499,9 +1530,26 @@ export class BrowserManager {
                 )
                 .catch((error) => "诊断失败：" + String(error))
             : "";
+        // 小红书/其他平台失败时同样落盘页面快照：没有证据就无法区分
+        // "视频没处理完"还是"平台改版/校验弹窗"
+        const genericDiagnostics =
+          account.platform === "douyin"
+            ? ""
+            : await wc
+                .executeJavaScript(
+                  "(()=>JSON.stringify({url:location.href,buttons:[...document.querySelectorAll('button,[role=button]')].map(e=>({text:(e.textContent||'').trim().slice(0,30),disabled:!!e.disabled,visible:!!e.offsetParent})).filter(e=>e.visible).slice(-40),alerts:[...document.querySelectorAll('[role=alert],[class*=error],[class*=toast],[class*=message]')].filter(e=>e.offsetParent!==null).map(e=>(e.textContent||'').trim().slice(0,120)).filter(Boolean).slice(-10),body:(document.body?.innerText||'').slice(0,6000)}))()",
+                )
+                .catch((error) => "诊断失败：" + String(error));
+        if (genericDiagnostics)
+          await writeBrowserLog(
+            "publish-not-ready " +
+              account.platform +
+              " " +
+              String(genericDiagnostics).slice(0, 6500),
+          );
         throw new Error(
           account.platform === "xiaohongshu"
-            ? "小红书真实发布按钮持续禁用，请检查视频处理、标题、正文、封面或平台校验提示"
+            ? "小红书真实发布按钮持续禁用，请检查视频处理、标题、正文、封面或平台校验提示（页面快照已记录到日志）"
             : "等待视频上传完成超时" +
                 (douyinDiagnostics
                   ? "；抖音控件诊断：" + douyinDiagnostics
@@ -2828,6 +2876,18 @@ export class BrowserManager {
       enabled: true,
     });
     try {
+      // B站上传页是 SPA：publish-loaded 后前端还要渲染几秒。先等上传
+      // 元素出现（最多 25 秒），否则 3 次重试会在 2 秒内全部落空
+      // （2026-10-28 实证：publish-loaded 后 2 秒即报 upload button not found）
+      for (let wait = 0; wait < 25; wait += 2) {
+        const appeared = await wc
+          .executeJavaScript(
+            "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0;return [...document.querySelectorAll('*')].some(e=>visible(e)&&/上传视频|点击上传|选择视频|拖拽|上传文件/.test((e.textContent||'').trim())&&(e.textContent||'').trim().length<20)})()",
+          )
+          .catch(() => false);
+        if (appeared) break;
+        await sleep(2000);
+      }
       for (let attempt = 1; attempt <= 3; attempt++) {
         chooserNodeId = undefined;
         const clicked = await this.clickButtonByText(
