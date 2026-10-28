@@ -45,7 +45,8 @@ import { platformMap, platforms } from "../../shared/platforms";
 const { Header, Sider, Content } = Layout;
 type Page = "accounts" | "image" | "video";
 const douyinSyncOptions: { value: DouyinSyncTarget; label: string }[] = [
-  { value: "toutiao", label: "头条" },
+  // 头条不提供同步：应用本身直发头条号，同步会造成同一视频重复发布
+  // （2026-10-28 用户确认移除）。番茄/懂车帝保留。
   { value: "fanqie", label: "番茄" },
   { value: "dongchedi", label: "懂车帝" },
 ];

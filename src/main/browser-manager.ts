@@ -1668,6 +1668,11 @@ export class BrowserManager {
         draft.douyinSyncTargets &&
         draft.douyinSyncTargets.length
       ) {
+        // 头条不再同步：应用本身直发头条号，同步会造成同一视频重复发布
+        // （2026-10-28 用户确认）。过滤掉旧草稿里残留的 toutiao 目标。
+        const syncTargets = draft.douyinSyncTargets.filter(
+          (target) => target !== "toutiao",
+        );
         const syncPatterns: Record<DouyinSyncTarget, RegExp> = {
           // 抖音同步发布的平台名在不同版本有变体："今日头条/头条号"、
           // "番茄小说/番茄"、"懂车帝"，因此用宽松匹配
@@ -1680,7 +1685,7 @@ export class BrowserManager {
           fanqie: "番茄",
           dongchedi: "懂车帝",
         };
-        for (const target of draft.douyinSyncTargets) {
+        for (const target of syncTargets) {
           const result = await this.ensureCheckboxByText(
             wc,
             [syncPatterns[target]],
