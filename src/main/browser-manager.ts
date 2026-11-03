@@ -1320,6 +1320,22 @@ export class BrowserManager {
             // selected. Confirming that frame satisfies the required cover
             // without any file upload, so prefer it over hunting for a
             // local-upload file control the dialog may not expose.
+            // 弹窗打开后常停在"解析中"（视频帧解析），此时点下一步无效——
+            // 必须先等解析完成（2026-11-03 实证：解析中直接点下一步后
+            // 确认按钮永远不出现）
+            const waitParsingDone = async () => {
+              for (let wait = 0; wait < 25; wait++) {
+                const parsing = await wc
+                  .executeJavaScript(
+                    "/解析中/.test(document.body?.innerText||'')",
+                  )
+                  .catch(() => false);
+                if (!parsing) return true;
+                await sleep(1000);
+              }
+              return false;
+            };
+            await waitParsingDone();
             const frameNext = await this.clickButtonByText(
               wc,
               ["下一步"],
@@ -1331,6 +1347,9 @@ export class BrowserManager {
             );
             if (frameNext) {
               confirmedViaFrame = true;
+              // 下一步后若进入第二段解析，同样等待完成再找确认按钮
+              await sleep(1500);
+              await waitParsingDone();
             } else {
               const localUploadOpened = await this.clickButtonByText(
                 wc,
@@ -1941,7 +1960,10 @@ export class BrowserManager {
         wc,
         account.platform,
         draft.title,
-        180000,
+        // 抖音：点击发布后平台还要转码处理，作品要几分钟后才出现在
+        // 内容管理列表（2026-11-03 实证：180 秒窗口内列表一直没有
+        // 目标作品，任务被误判失败而实际发布成功），验真窗口放宽到 5 分钟
+        account.platform === "douyin" ? 300000 : 180000,
       );
       const declarationSuffix = declarationNotes.length
         ? "；" + declarationNotes.join("、")
@@ -2959,6 +2981,14 @@ export class BrowserManager {
         if (!inputNodeId)
           throw new Error("Bilibili current video upload control not found");
         await this.setFileInput(wc, inputNodeId, [file]);
+        // 文件选择器拦截路径失效时（2026-11-03 实证：按钮点击了但
+        // chooser 从未打开），直接绑定 input 后页面不会自己响应——
+        // 必须手动派发 change/input 事件驱动上传
+        await wc
+          .executeJavaScript(
+            "(()=>{for(const input of document.querySelectorAll('input[type=file]')){input.dispatchEvent(new Event('change',{bubbles:true}));input.dispatchEvent(new Event('input',{bubbles:true}))}return true})()",
+          )
+          .catch(() => undefined);
         const uploadStart = await this.waitForBilibiliUploadStart(wc, 25000);
         await writeBrowserLog(
           "bilibili-upload-attempt " +
@@ -3828,7 +3858,7 @@ export class BrowserManager {
       // main document query finds nothing, so poll every frame before
       // declaring the input ineffective.
       const titleQuery =
-        "((value)=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const hint=e=>(e.placeholder||'')+(e.getAttribute('data-placeholder')||'');const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;const inputs=all(document).filter(e=>visible(e)&&e.matches?.('input')&&/[0-9][～-]30|标题/.test(hint(e)));for(const e of inputs){e.focus();setter?setter.call(e,value):e.value=value;e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));e.blur?.()}return{values:inputs.map(e=>e.value),placeholders:inputs.map(e=>hint(e)),value:inputs.at(-1)?.value||'',placeholder:inputs.at(-1)?hint(inputs.at(-1))||inputs.at(-1).placeholder||'':''}})(" +
+        "((value)=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const hint=e=>(e.placeholder||'')+(e.getAttribute('data-placeholder')||'');const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;const inputs=all(document).filter(e=>visible(e)&&e.matches?.('input')&&/[0-9][～-]30|标题/.test(hint(e)));for(const e of inputs){e.focus();setter?setter.call(e,''):e.value='';e.dispatchEvent(new InputEvent('input',{bubbles:true}));setter?setter.call(e,value):e.value=value;e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));e.blur?.()}return{values:inputs.map(e=>e.value),placeholders:inputs.map(e=>hint(e)),value:inputs.at(-1)?.value||'',placeholder:inputs.at(-1)?hint(inputs.at(-1))||inputs.at(-1).placeholder||'':''}})(" +
         JSON.stringify(title) +
         ")";
       let titleState: { value: string; placeholder: string } = {
