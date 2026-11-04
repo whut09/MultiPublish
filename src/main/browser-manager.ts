@@ -1411,30 +1411,61 @@ export class BrowserManager {
                 "toutiao-cover-frame-stuck " +
                   JSON.stringify(frameReady).slice(0, 2000),
               );
-              const closed = await this.clickButtonByText(
-                wc,
-                ["取消", "关闭"],
-                false,
-                false,
-              );
-              if (!closed)
-                await wc
-                  .executeJavaScript(
-                    "(()=>{const e=[...document.querySelectorAll('[class*=close],[class*=Close],[aria-label*=关闭]')].filter(e=>e.getClientRects?.().length>0)[0];if(!e)return false;e.click();return true})()",
-                  )
-                  .catch(() => false);
-              await sleep(2500);
-              const reopened = await openCoverModal();
-              await writeBrowserLog(
-                "toutiao-cover-modal-reopen " + String(reopened),
-              );
-              if (reopened) {
-                await sleep(1500);
-                await waitParsingDone();
-                for (let wait = 0; wait < 15; wait++) {
-                  frameReady = await probeFrameReady();
-                  if (frameReady.ready) break;
-                  await sleep(2000);
+              // 逃生通道：切"本地上传"页签用草稿封面图，完全绕开帧截取。
+              // 部分视频的帧始终不渲染（2026-11-04 MIT 视频实证：关弹窗
+              // 重开后仍 00:00，点下一步原地不动），此时本地封面图是唯一
+              // 可靠路径
+              if (draft.coverPath) {
+                const localTab = await this.clickButtonByText(
+                  wc,
+                  ["本地上传"],
+                  false,
+                  false,
+                );
+                await writeBrowserLog(
+                  "toutiao-cover-local-tab " + String(localTab),
+                );
+                if (localTab) {
+                  await sleep(1500);
+                  localCoverInput = await this.waitForMatchingFileInput(
+                    wc,
+                    "image",
+                    8000,
+                    [videoNodeId],
+                  );
+                  await writeBrowserLog(
+                    "toutiao-cover-local-input " +
+                      String(!!localCoverInput),
+                  );
+                }
+              }
+              if (!localCoverInput) {
+                // 本地通道不可用才走原重开逻辑
+                const closed = await this.clickButtonByText(
+                  wc,
+                  ["取消", "关闭"],
+                  false,
+                  false,
+                );
+                if (!closed)
+                  await wc
+                    .executeJavaScript(
+                      "(()=>{const e=[...document.querySelectorAll('[class*=close],[class*=Close],[aria-label*=关闭]')].filter(e=>e.getClientRects?.().length>0)[0];if(!e)return false;e.click();return true})()",
+                    )
+                    .catch(() => false);
+                await sleep(2500);
+                const reopened = await openCoverModal();
+                await writeBrowserLog(
+                  "toutiao-cover-modal-reopen " + String(reopened),
+                );
+                if (reopened) {
+                  await sleep(1500);
+                  await waitParsingDone();
+                  for (let wait = 0; wait < 15; wait++) {
+                    frameReady = await probeFrameReady();
+                    if (frameReady.ready) break;
+                    await sleep(2000);
+                  }
                 }
               }
             }
@@ -1442,6 +1473,10 @@ export class BrowserManager {
               "toutiao-cover-frame-ready " +
                 JSON.stringify(frameReady).slice(0, 800),
             );
+            if (localCoverInput) {
+              // 已切到本地上传页签并找到图片控件：直接走本地封面图路径
+              //（下方 else 分支负责 setFileInput + 下一步）
+            } else {
             const frameNext = await this.clickButtonByText(
               wc,
               ["下一步"],
@@ -1496,6 +1531,7 @@ export class BrowserManager {
                 15000,
                 [videoNodeId],
               );
+            }
             }
           }
           if (confirmedViaFrame) {
@@ -3178,30 +3214,61 @@ export class BrowserManager {
               "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const nodes=all(document).filter(visible);const target=nodes.filter(e=>/上传|选择|拖拽/.test((e.textContent||'')+' '+(e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||''))&&/视频|文件|video|upload/i.test((e.textContent||'')+' '+(e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||'')+' '+String(e.className||''))).sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return ar.width*ar.height-br.width*br.height})[0];if(!target)return false;target.click();return true})()",
             )
             .catch(() => false);
-          if (!fallbackClicked)
-            throw new Error("Bilibili current upload button not found");
         }
         let inputNodeId = 0;
-        const chooserStart = Date.now();
-        while (Date.now() - chooserStart < 15000) {
-          if (chooserNodeId) {
-            inputNodeId = chooserNodeId;
-            break;
-          }
-          await sleep(200);
-        }
-        if (!inputNodeId) {
-          const currentInput = await this.waitForBilibiliVideoInput(wc, 10000);
-          if (currentInput) {
-            inputNodeId = currentInput.nodeId;
+        if (!clicked && !fallbackClicked) {
+          // 按钮文本找不到时不再直接抛错（2026-11-04 MIT 批次实证：
+          // "upload button not found" 时页面可能改版/文本在 iframe 里）。
+          // 先落盘现场快照，再尝试直接 pierce 搜索上传 file input 绑文件
+          const buttonSnapshot = await wc
+            .executeJavaScript(
+              "(()=>JSON.stringify({url:location.href,frames:[...document.querySelectorAll('iframe')].map(f=>({src:(f.src||'').slice(0,120)})),buttons:[...document.querySelectorAll('button,[role=button],div,span')].filter(e=>e.getClientRects?.().length>0&&(e.textContent||'').trim().length<24).map(e=>(e.textContent||'').trim()).filter(t=>/上传|投稿|拖拽|选择|视频/.test(t)).slice(0,30),body:(document.body?.innerText||'').slice(0,1500)}))()",
+            )
+            .catch(() => "");
+          await writeBrowserLog(
+            "bilibili-upload-button-missing " +
+              String(buttonSnapshot).slice(0, 4000),
+          );
+          const direct = await this.waitForBilibiliVideoInput(wc, 10000);
+          if (direct) {
+            inputNodeId = direct.nodeId;
             void writeBrowserLog(
-              "bilibili-input-picked " +
-                JSON.stringify({
-                  attempt,
-                  score: currentInput.score,
-                  info: currentInput.info,
-                }).slice(0, 600),
+              "bilibili-input-direct " +
+                JSON.stringify({ score: direct.score, info: direct.info }).slice(
+                  0,
+                  600,
+                ),
             );
+          } else
+            throw new Error("Bilibili current upload button not found");
+        }
+        if (inputNodeId) {
+          // 直接绑定路径：跳过 chooser 等待
+        } else {
+          const chooserStart = Date.now();
+          while (Date.now() - chooserStart < 15000) {
+            if (chooserNodeId) {
+              inputNodeId = chooserNodeId;
+              break;
+            }
+            await sleep(200);
+          }
+          if (!inputNodeId) {
+            const currentInput = await this.waitForBilibiliVideoInput(
+              wc,
+              10000,
+            );
+            if (currentInput) {
+              inputNodeId = currentInput.nodeId;
+              void writeBrowserLog(
+                "bilibili-input-picked " +
+                  JSON.stringify({
+                    attempt,
+                    score: currentInput.score,
+                    info: currentInput.info,
+                  }).slice(0, 600),
+              );
+            }
           }
         }
         if (!inputNodeId)
