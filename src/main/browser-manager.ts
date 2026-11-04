@@ -1347,7 +1347,25 @@ export class BrowserManager {
             );
             if (frameNext) {
               confirmedViaFrame = true;
-              // 下一步后若进入第二段解析，同样等待完成再找确认按钮
+              // 自纠错：封面帧未就绪时（帧时间显示 00:00，2026-11-04 实证）
+              // 点下一步弹窗会原地不动。每轮点完检查是否出现确认按钮，
+              // 未前进就再点下一步，最多 5 轮
+              for (let retry = 0; retry < 5; retry++) {
+                await sleep(3000);
+                const confirmVisible = await wc
+                  .executeJavaScript(
+                    "/裁剪完成|完成后无法继续编辑|(^|\\n)(完成|确定|保存)(\\n|$)/.test(document.body?.innerText||'')",
+                  )
+                  .catch(() => false);
+                if (confirmVisible) break;
+                const nextAgain = await this.clickButtonByText(
+                  wc,
+                  ["下一步"],
+                  true,
+                  true,
+                );
+                if (!nextAgain) break;
+              }
               await sleep(1500);
               await waitParsingDone();
             } else {
@@ -1978,6 +1996,22 @@ export class BrowserManager {
             declarationSuffix,
         };
       if (result.success) {
+        if (account.platform === "douyin") {
+          // 抖音点击发布后平台要转码处理，作品管理列表可能长时间不出现
+          // 目标作品（11-03/11-04 两批实证：点击与跳转正常、5 分钟窗口
+          // 内列表缺失）。此时结果不确定：不能判成功，也不该直接判失败
+          // （11-03 批次误判失败而实际成功）——转为需人工核对
+          const evidence = await this.captureFailure(wc, account.platform).catch(
+            () => undefined,
+          );
+          return {
+            status: "manual_required" as const,
+            message:
+              "抖音发布点击已完成，但作品管理 5 分钟内未出现目标标题（平台可能仍在转码）。请稍后在抖音 App/创作者中心核对：已发布可忽略本任务，未发布请点重新发布" +
+              declarationSuffix +
+              (evidence ? "；现场截图：" + evidence : ""),
+          };
+        }
         const evidence = await this.captureFailure(wc, account.platform).catch(
           () => undefined,
         );
@@ -2990,6 +3024,16 @@ export class BrowserManager {
           )
           .catch(() => undefined);
         const uploadStart = await this.waitForBilibiliUploadStart(wc, 25000);
+        // 上传未开始时落盘页面现场：被点元素、全部 file input、页面文本，
+        // 用于定位"点击了但选择器不开/文件已设但页面不响应"的差异
+        let missingDiag = "";
+        if (!uploadStart.started) {
+          missingDiag = await wc
+            .executeJavaScript(
+              "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0;return JSON.stringify({url:location.href,buttons:[...document.querySelectorAll('button,[role=button],div[class*=upload],span[class*=upload]')].filter(e=>visible(e)&&/上传|选择|拖拽/.test((e.textContent||'').trim())&&(e.textContent||'').trim().length<24).map(e=>({tag:e.tagName,text:(e.textContent||'').trim().slice(0,24),cls:String(e.className||'').slice(0,90)})).slice(0,12),fileInputs:[...document.querySelectorAll('input[type=file]')].map(e=>({accept:e.accept||'',visible:visible(e),cls:String(e.className||'').slice(0,60)})),body:(document.body?.innerText||'').slice(0,1500)}))()",
+            )
+            .catch((error) => "诊断失败：" + String(error));
+        }
         await writeBrowserLog(
           "bilibili-upload-attempt " +
             JSON.stringify({
@@ -2998,7 +3042,8 @@ export class BrowserManager {
               fallbackClicked,
               usedChooser: chooserNodeId !== undefined,
               ...uploadStart,
-            }).slice(0, 4000),
+              diag: missingDiag || undefined,
+            }).slice(0, 6000),
         );
         if (uploadStart.started) return inputNodeId;
       }
