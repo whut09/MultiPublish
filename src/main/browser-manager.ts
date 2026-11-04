@@ -671,6 +671,14 @@ export class BrowserManager {
         await sleep(3000);
       }
       if (account.platform === "bilibili") {
+        const initialPage = await wc
+          .executeJavaScript(
+            "(()=>JSON.stringify({url:location.href,body:(document.body?.innerText||'').slice(0,2000)}))()",
+          )
+          .catch(() => "");
+        void writeBrowserLog(
+          "bilibili-page-initial " + String(initialPage).slice(0, 3200),
+        );
         const hasStaleDraft = await wc
           .executeJavaScript(
             "/本地浏览器存在.*未提交/.test(document.body?.innerText||'')",
@@ -689,6 +697,19 @@ export class BrowserManager {
             );
           await sleep(1800);
         }
+        // B站会把上次未提交的稿件静默恢复成分P（2026-11-04 Strata 实证：
+        // 连续三轮分P 1→2→3 累积，恢复稿卡在"上传中"会让立即投稿永久
+        // 无效）。上传前清掉已恢复的分P条目
+        const restoredCleanup = await this.cleanupBilibiliPageEntries(
+          wc,
+          "restored",
+        );
+        if (restoredCleanup)
+          void writeBrowserLog(
+            "bilibili-restored-p-cleanup " +
+              JSON.stringify(restoredCleanup).slice(0, 3000),
+          );
+        if (restoredCleanup && restoredCleanup.clicked > 0) await sleep(2500);
       }
       await progress("uploading", "正在等待平台上传控件");
       let videoNodeId = 0;
@@ -1362,6 +1383,9 @@ export class BrowserManager {
             [videoNodeId],
           );
           let confirmedViaFrame = false;
+          // 帧卡死逃生通道里已通过 chooser 预先设置封面图时为 true，
+          // 末尾的 setFileInput/chooseFileFromButton 需要跳过
+          let localCoverPreSet = false;
           if (!localCoverInput) {
             // The editor opens on 封面截取 with a default video frame already
             // selected. Confirming that frame satisfies the required cover
@@ -1437,6 +1461,33 @@ export class BrowserManager {
                     "toutiao-cover-local-input " +
                       String(!!localCoverInput),
                   );
+                  if (!localCoverInput) {
+                    // 页签里没有裸露的 image input（2026-11-04 Strata 批次
+                    // 实证 local-input false）：点页签内的上传按钮，走
+                    // chooser 拦截直接设置封面图
+                    try {
+                      await this.chooseFileFromButton(
+                        wc,
+                        ["点击上传", "上传图片", "上传封面", "选择图片", "本地上传"],
+                        draft.coverPath,
+                      );
+                      localCoverPreSet = true;
+                      await writeBrowserLog(
+                        "toutiao-cover-local-chooser true",
+                      );
+                    } catch (chooserError) {
+                      await writeBrowserLog(
+                        "toutiao-cover-local-chooser false " +
+                          String(chooserError).slice(0, 300),
+                      );
+                      localCoverInput = await this.waitForMatchingFileInput(
+                        wc,
+                        "image",
+                        4000,
+                        [videoNodeId],
+                      );
+                    }
+                  }
                 }
               }
               if (!localCoverInput) {
@@ -1541,7 +1592,7 @@ export class BrowserManager {
               await this.setFileInput(wc, localCoverInput.nodeId, [
                 draft.coverPath,
               ]);
-            else
+            else if (!localCoverPreSet)
               await this.chooseFileFromButton(
                 wc,
                 ["本地上传", "本地上传图片", "点击上传", "上传图片", "从本地选择"],
@@ -2099,6 +2150,148 @@ export class BrowserManager {
             ],
             true,
           );
+        }
+        // 提交确认：必须等到投稿成功页/成功文本，否则视为未提交。
+        // （2026-11-04 MIT 实证：点了立即投稿但稿件从未落库，验真时
+        // 还停留在投稿页误匹配标题表单，报了假成功）
+        const bilibiliSubmitted = async () => {
+          if (/upload\/success|group=pubed/.test(wc.getURL())) return true;
+          return await wc
+            .executeJavaScript(
+              "/投稿成功|稿件投递成功|投递成功|成功投稿/.test(document.body?.innerText||'')",
+            )
+            .catch(() => false);
+        };
+        let submittedOk = false;
+        // 封面 16:9 同步确认弹窗：自动设置封面后点立即投稿，B 站必弹
+        // "检测到个人空间封面（16:9）未修改…是否同步"，不处理会永远
+        // 挡住提交（2026-11-04 Strata/MIT 两批实证）
+        const handleBilibiliCoverSyncDialog = async () => {
+          const confirmed = await this.clickButtonByText(
+            wc,
+            ["确认同步"],
+            false,
+            false,
+          );
+          if (confirmed) {
+            await writeBrowserLog("bilibili-cover-sync-confirmed");
+            await sleep(2500);
+          }
+          return confirmed;
+        };
+        // 封面制作弹窗：同步确认后会链式弹出封面编辑器，不点"完成"
+        // 会挡住整页（2026-11-04 Strata 实证：鼠标重试全打在弹窗上）
+        const handleBilibiliCoverEditor = async () => {
+          const done = await wc
+            .executeJavaScript(
+              "(()=>{if(!/封面制作/.test(document.body?.innerText||''))return false;const btns=[...document.querySelectorAll('button,[role=button]')].filter(e=>e.getClientRects?.().length>0&&(e.textContent||'').trim()==='完成');const t=btns.at(-1);if(!t)return false;t.click();return true})()",
+            )
+            .catch(() => false);
+          if (done) {
+            await writeBrowserLog("bilibili-cover-editor-completed");
+            await sleep(2500);
+          }
+          return done;
+        };
+        const clearBilibiliSubmitDialogs = async () => {
+          for (let round = 0; round < 4; round++) {
+            const a = await handleBilibiliCoverSyncDialog();
+            const b = await handleBilibiliCoverEditor();
+            if (!a && !b) break;
+          }
+        };
+        if (clicked) {
+          for (let wait = 0; wait < 10 && !submittedOk; wait++) {
+            await sleep(3000);
+            await clearBilibiliSubmitDialogs();
+            // 恢复稿分P卡在"上传中"会让立即投稿永久无效，清掉
+            const zombie = await this.cleanupBilibiliPageEntries(
+              wc,
+              "zombie",
+            );
+            if (zombie && zombie.clicked > 0) {
+              await writeBrowserLog(
+                "bilibili-zombie-p-cleanup " +
+                  JSON.stringify(zombie).slice(0, 3000),
+              );
+              await sleep(3000);
+              await this.clickButtonByText(wc, ["确定"], false, false);
+            }
+            submittedOk = await bilibiliSubmitted();
+          }
+        }
+        if (!submittedOk && clicked) {
+          const submitDiag = await wc
+            .executeJavaScript(
+              "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0;return JSON.stringify({url:location.href,buttons:[...document.querySelectorAll('button,[role=button]')].filter(e=>visible(e)&&(e.textContent||'').trim().length<12).map(e=>({text:(e.textContent||'').trim(),disabled:!!e.disabled})).slice(-25),hints:[...document.querySelectorAll('div,span,p')].filter(visible).map(e=>(e.textContent||'').trim()).filter(t=>t&&t.length<100&&/投稿|封面|分区|标签|失败|错误|必填|请/.test(t)).slice(-15),body:(document.body?.innerText||'').slice(0,2000)})})()",
+            )
+            .catch((error) => String(error));
+          await writeBrowserLog(
+            "bilibili-submit-stuck " + String(submitDiag).slice(0, 6000),
+          );
+          // 先清掉可能存在的封面同步/封面制作弹窗，再重试提交
+          await clearBilibiliSubmitDialogs();
+          const zombieStuck = await this.cleanupBilibiliPageEntries(
+            wc,
+            "zombie",
+          );
+          if (zombieStuck && zombieStuck.clicked > 0) {
+            await writeBrowserLog(
+              "bilibili-zombie-p-cleanup-stuck " +
+                JSON.stringify(zombieStuck).slice(0, 3000),
+            );
+            await sleep(3000);
+            await this.clickButtonByText(wc, ["确定"], false, false);
+            await sleep(1500);
+          }
+          if (!submittedOk)
+            await this.clickButtonByText(
+              wc,
+              ["确定", "确认投稿", "继续投稿"],
+              true,
+              false,
+            );
+          const rect = await wc
+            .executeJavaScript(
+              "(()=>{const btns=[...document.querySelectorAll('button,[role=button],div,span')].filter(e=>e.getClientRects?.().length>0&&(e.textContent||'').trim()==='立即投稿'&&!e.disabled);const t=btns.at(-1);if(!t)return null;t.scrollIntoView({block:'center'});const r=t.getBoundingClientRect();return{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)}})()",
+            )
+            .catch(() => null);
+          if (rect && Number.isFinite(rect.x)) {
+            if (!wc.debugger.isAttached()) await wc.debugger.attach("1.3");
+            await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+              type: "mouseMoved",
+              x: rect.x,
+              y: rect.y,
+            });
+            await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+              type: "mousePressed",
+              x: rect.x,
+              y: rect.y,
+              button: "left",
+              buttons: 1,
+              clickCount: 1,
+            });
+            await sleep(120);
+            await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+              type: "mouseReleased",
+              x: rect.x,
+              y: rect.y,
+              button: "left",
+              buttons: 0,
+              clickCount: 1,
+            });
+            await writeBrowserLog(
+              "bilibili-submit-retry-mouse " + JSON.stringify(rect),
+            );
+            for (let wait = 0; wait < 10 && !submittedOk; wait++) {
+              await sleep(3000);
+              submittedOk = await bilibiliSubmitted();
+            }
+          }
+          if (!submittedOk)
+            await writeBrowserLog(
+              "bilibili-submit-no-confirm url=" + wc.getURL(),
+            );
         }
       } else {
         clicked = await this.clickButtonByText(
@@ -3174,6 +3367,45 @@ export class BrowserManager {
     }
     return { started: false, evidence };
   }
+  // 清理B站上传页的分P条目。mode=restored：清除自动恢复的历史稿件分P
+  // （上传前调用，标记是"更换视频"按钮）；mode=zombie：清除卡在"上传中"
+  // 的分P（提交被挡时调用）。每次都会把条目 DOM 结构落盘，删除控件
+  // 找不到时靠 dump 定位真实控件
+  private async cleanupBilibiliPageEntries(
+    wc: Electron.WebContents,
+    mode: "restored" | "zombie",
+  ) {
+    const modeJson = JSON.stringify(mode);
+    return await wc
+      .executeJavaScript(
+        "(()=>{" +
+          "const body=document.body?.innerText||'';" +
+          "const mode=" +
+          modeJson +
+          ";" +
+          "let markers=[];" +
+          "if(mode==='restored'){" +
+          "if(!/更换视频/.test(body))return{need:false,reason:'no-restored'};" +
+          "markers=[...document.querySelectorAll('button,div,span,a')].filter(e=>e.getClientRects?.().length>0&&(e.textContent||'').trim()==='更换视频');" +
+          "}else{" +
+          "if(!/上传中/.test(body)||!/上传完成|更换视频/.test(body))return{need:false,reason:'no-zombie'};" +
+          "markers=[...document.querySelectorAll('div,li,span,p')].filter(e=>e.getClientRects?.().length>0&&(e.textContent||'').includes('上传中')).sort((a,b)=>(a.textContent||'').length-(b.textContent||'').length).slice(0,2);" +
+          "}" +
+          "const results=[];let clicked=0;" +
+          "for(const marker of markers.slice(0,4)){" +
+          "let root=marker;" +
+          "for(let i=0;i<8&&root&&root!==document.body;i++,root=root.parentElement){const t=(root.textContent||'');if(t.length>60&&t.length<600)break;}" +
+          "if(!root||root===document.body)continue;" +
+          "const dels=[...root.querySelectorAll('button,[role=button],i,[class*=delete],[class*=close],[class*=remove]')].filter(e=>e.getClientRects?.().length>0&&(/^删除$/.test((e.textContent||'').trim())||/delete|close|remove/i.test(String(e.className||''))));" +
+          "const del=dels[0];" +
+          "results.push({text:(root.textContent||'').slice(0,80),delFound:!!del,delCls:del?String(del.className||'').slice(0,80):'',html:root.outerHTML.slice(0,700)});" +
+          "if(del){del.click();clicked++;}" +
+          "}" +
+          "return{need:true,mode,candidates:markers.length,clicked,results};" +
+          "})()",
+      )
+      .catch(() => undefined);
+  }
   private async uploadBilibiliVideo(wc: Electron.WebContents, file: string) {
     if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
     await wc.debugger.sendCommand("Page.enable").catch(() => undefined);
@@ -3254,20 +3486,89 @@ export class BrowserManager {
             await sleep(200);
           }
           if (!inputNodeId) {
+            // chooser 未开：程序化 click 真实的 video input，让页面自己
+            // 打开 chooser（拦截模式下会触发 fileChooserOpened）。
+            // （2026-11-04 Strata 批次实证：CDP 点击上传按钮但 chooser
+            // 三次都没开）
+            const jsClicked = await wc
+              .executeJavaScript(
+                "(()=>{const inputs=[...document.querySelectorAll('input[type=file]')].filter(e=>/video/i.test(e.accept||''));const target=inputs.find(e=>e.getClientRects?.().length>0)||inputs[0];if(!target)return false;target.click();return true})()",
+              )
+              .catch(() => false);
+            await writeBrowserLog(
+              "bilibili-js-input-click " + String(jsClicked),
+            );
+            const jsStart = Date.now();
+            while (Date.now() - jsStart < 6000) {
+              if (chooserNodeId) {
+                inputNodeId = chooserNodeId;
+                break;
+              }
+              await sleep(200);
+            }
+          }
+          if (!inputNodeId) {
             const currentInput = await this.waitForBilibiliVideoInput(
               wc,
               10000,
             );
             if (currentInput) {
-              inputNodeId = currentInput.nodeId;
-              void writeBrowserLog(
-                "bilibili-input-picked " +
-                  JSON.stringify({
-                    attempt,
-                    score: currentInput.score,
-                    info: currentInput.info,
-                  }).slice(0, 600),
-              );
+              // 活性校验：SPA 重渲染会让旧节点游离，setFileInput 设到
+              // 游离节点上页面毫无反应（文件在 input.files 里但上传不启动）
+              let live = true;
+              try {
+                const resolved = await wc.debugger.sendCommand(
+                  "DOM.resolveNode",
+                  { backendNodeId: currentInput.nodeId },
+                );
+                const objectId = resolved.object?.objectId;
+                if (objectId) {
+                  const state = await wc.debugger.sendCommand(
+                    "Runtime.callFunctionOn",
+                    {
+                      objectId,
+                      functionDeclaration:
+                        'function(){return{connected:this.isConnected,visible:this.getClientRects().length>0}}',
+                      returnByValue: true,
+                    },
+                  );
+                  const value = state.result?.value;
+                  live = !!(value && value.connected);
+                  await writeBrowserLog(
+                    "bilibili-input-state " +
+                      JSON.stringify(value).slice(0, 200),
+                  );
+                  await wc.debugger
+                    .sendCommand("Runtime.releaseObject", { objectId })
+                    .catch(() => undefined);
+                }
+              } catch {
+                // 校验失败按可用处理
+              }
+              if (live) {
+                inputNodeId = currentInput.nodeId;
+                void writeBrowserLog(
+                  "bilibili-input-picked " +
+                    JSON.stringify({
+                      attempt,
+                      score: currentInput.score,
+                      info: currentInput.info,
+                    }).slice(0, 600),
+                );
+              } else {
+                const fresh = await this.waitForBilibiliVideoInput(wc, 8000);
+                if (fresh) {
+                  inputNodeId = fresh.nodeId;
+                  void writeBrowserLog(
+                    "bilibili-input-refetched " +
+                      JSON.stringify({
+                        attempt,
+                        score: fresh.score,
+                        info: fresh.info,
+                      }).slice(0, 600),
+                  );
+                }
+              }
             }
           }
         }
@@ -4634,7 +4935,22 @@ export class BrowserManager {
         const matchedNormalized = matchedRaw
           ? undefined
           : expected.find((value) => normalizedText.includes(value));
-        if (matchedRaw || matchedNormalized) {
+        // URL 守卫：标题必须出现在作品管理页才算发布成功。投稿页本身
+        // 就含标题表单，loadURL 失败/被重定向时会把表单标题误判成已
+        // 发布（2026-11-04 B站 MIT 实证：verify 停在 upload/video/frame
+        // 却报了"已找到目标标题"的假成功）
+        const manageUrlPatterns: Partial<Record<Account["platform"], RegExp>> =
+          {
+            bilibili: /member\.bilibili\.com\/platform\/upload-manager\//,
+            douyin: /creator\.douyin\.com\/creator-micro\/content\/manage/,
+            toutiao: /mp\.toutiao\.com\/profile_v4\/manage\/content\//,
+            kuaishou: /cp\.kuaishou\.com\/article\/manage\//,
+            xiaohongshu: /note-manager/,
+          };
+        const manageUrlOk = manageUrlPatterns[platform]
+          ? manageUrlPatterns[platform]!.test(snapshot.url)
+          : true;
+        if ((matchedRaw || matchedNormalized) && manageUrlOk) {
           await writeBrowserLog("backend-title-verified " + JSON.stringify({
             platform, title: platformTitle, url: snapshot.url,
             source: "manager-dom",
