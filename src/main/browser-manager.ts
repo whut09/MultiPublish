@@ -2204,19 +2204,6 @@ export class BrowserManager {
           for (let wait = 0; wait < 10 && !submittedOk; wait++) {
             await sleep(3000);
             await clearBilibiliSubmitDialogs();
-            // 恢复稿分P卡在"上传中"会让立即投稿永久无效，清掉
-            const zombie = await this.cleanupBilibiliPageEntries(
-              wc,
-              "zombie",
-            );
-            if (zombie && zombie.clicked > 0) {
-              await writeBrowserLog(
-                "bilibili-zombie-p-cleanup " +
-                  JSON.stringify(zombie).slice(0, 3000),
-              );
-              await sleep(3000);
-              await this.clickButtonByText(wc, ["确定"], false, false);
-            }
             submittedOk = await bilibiliSubmitted();
           }
         }
@@ -2229,21 +2216,11 @@ export class BrowserManager {
           await writeBrowserLog(
             "bilibili-submit-stuck " + String(submitDiag).slice(0, 6000),
           );
-          // 先清掉可能存在的封面同步/封面制作弹窗，再重试提交
+          // 先清掉可能存在的封面同步/封面制作弹窗，再重试提交。
+          // 注意：提交期不做分P删除——恢复稿清理只在上传前做，此时
+          // 分不清僵尸稿和我们刚上传的分P，误删会清空稿件并丢失分区
+          // （2026-11-04 MIT 终验实证：误删后"请选择分区"）
           await clearBilibiliSubmitDialogs();
-          const zombieStuck = await this.cleanupBilibiliPageEntries(
-            wc,
-            "zombie",
-          );
-          if (zombieStuck && zombieStuck.clicked > 0) {
-            await writeBrowserLog(
-              "bilibili-zombie-p-cleanup-stuck " +
-                JSON.stringify(zombieStuck).slice(0, 3000),
-            );
-            await sleep(3000);
-            await this.clickButtonByText(wc, ["确定"], false, false);
-            await sleep(1500);
-          }
           if (!submittedOk)
             await this.clickButtonByText(
               wc,
@@ -2468,6 +2445,19 @@ export class BrowserManager {
         wc,
         account.platform,
       ).catch(() => undefined);
+      if (account.platform === "bilibili") {
+        // B站稿件列表有延迟，且存在未完成草稿时稿件管理页会重定向回
+        // 投稿页，验真窗口内可能看不到已落库的稿件（2026-11-04 Strata
+        // 实证：重试提交 15 秒后落库，验真却 miss，下次发布的防重复
+        // 预检才确认"已存在"）。如实转人工核对并给出自愈路径
+        return {
+          status: "manual_required" as const,
+          message:
+            "B站已点击立即投稿，平台未在等待窗口内确认结果（稿件列表有延迟）。请稍后在内容管理-稿件管理核对：已发布可忽略本任务；未发布请点重新发布（发布前会自动检查后台是否已存在，不会重复发布）" +
+            declarationSuffix +
+            (unconfirmedEvidence ? "；现场截图：" + unconfirmedEvidence : ""),
+        };
+      }
       return {
         status: "manual_required" as const,
         message:
