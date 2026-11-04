@@ -371,25 +371,47 @@ export class BrowserManager {
         "opening",
         "正在进入" + platformMap[account.platform].name + "发布页面",
       );
-      await wc
-        .loadURL(
-          account.platform === "xiaohongshu"
-            ? this.xhsUrl(account, XHS_PUBLISH_PATH)
-            : platformMap[account.platform].publishUrl,
-        )
-        .catch(async (error) => {
-          const message = String(error);
-          void writeBrowserLog(
-            "publish-load-error account=" +
-              account.id +
-              " url=" +
-              wc.getURL() +
-              " error=" +
-              message,
+      // 网络抖动会导致发布页一次加载直接失败（2026-11-04 实证：快手
+      // ERR_CONNECTION_CLOSED (-100) 整个任务失败，同期其他平台正常），
+      // 对瞬时网络类错误自动重试加载，最多 2 次
+      const loadPublishPage = async (): Promise<void> => {
+        for (let loadAttempt = 1; loadAttempt <= 3; loadAttempt++) {
+          const loadError = await wc
+            .loadURL(
+              account.platform === "xiaohongshu"
+                ? this.xhsUrl(account, XHS_PUBLISH_PATH)
+                : platformMap[account.platform].publishUrl,
+            )
+            .then(() => undefined)
+            .catch((error) => {
+              const message = String(error);
+              void writeBrowserLog(
+                "publish-load-error account=" +
+                  account.id +
+                  " url=" +
+                  wc.getURL() +
+                  " error=" +
+                  message,
+              );
+              // ERR_ABORTED 通常是发布流程中的主动跳转，维持原有吞掉行为
+              if (/ERR_ABORTED/.test(message)) return undefined;
+              return error;
+            });
+          if (!loadError) return;
+          const transient = /ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_NETWORK_CHANGED|ERR_TIMED_OUT|ERR_NAME_NOT_RESOLVED|ERR_INTERNET_DISCONNECTED|ERR_HTTP2_PROTOCOL_ERROR/.test(
+            String(loadError),
           );
-          if (!/ERR_ABORTED/.test(message)) throw error;
-          await sleep(1500);
-        });
+          if (!transient || loadAttempt >= 3) throw loadError;
+          void writeBrowserLog(
+            "publish-load-retry account=" +
+              account.id +
+              " attempt=" +
+              loadAttempt,
+          );
+          await sleep(5000);
+        }
+      };
+      await loadPublishPage();
       if (account.platform === "weixin") {
         this.weixinRemoteUploadAt.delete(wc.id);
         this.weixinUploadFailures.delete(wc.id);
@@ -695,13 +717,37 @@ export class BrowserManager {
         // "找不到上传控件"，均为页面未渲染完）。这里先等控件出现。
         const inputs = await this.waitForFileInputs(wc, 60000);
         if (!inputs.length) {
-          // 再给一次机会：等待页面出现任何上传相关元素（最多 30 秒）
+          // 再给一次机会：等待页面出现任何上传相关元素（最多 30 秒）。
+          // SPA 内层出现"应用加载失败，请刷新重试"时（2026-11-04 快手
+          // 实证：外壳正常、内容区加载失败，干等必然超时），自动重载恢复
+          let reloaded = false;
           for (let wait = 0; wait < 30; wait += 2) {
             await sleep(2000);
             const retryInputs = await this.waitForFileInputs(wc, 1000);
             if (retryInputs.length) {
               inputs.push(...retryInputs);
               break;
+            }
+            if (!reloaded) {
+              const broken = await wc
+                .executeJavaScript(
+                  "/应用加载失败，请刷新重试|页面加载失败|加载失败，请重试/.test(document.body?.innerText||'')",
+                )
+                .catch(() => false);
+              if (broken) {
+                await writeBrowserLog(
+                  "spa-app-load-failed-reload " +
+                    account.platform +
+                    " url=" +
+                    wc.getURL(),
+                );
+                try {
+                  wc.reload();
+                } catch {
+                  // 窗口可能已销毁，忽略
+                }
+                reloaded = true;
+              }
             }
           }
         }
@@ -1294,7 +1340,7 @@ export class BrowserManager {
             )
             .catch(() => "");
           void writeBrowserLog("toutiao-cover-before " + coverBefore.slice(0, 18000));
-          const coverModalOpened =
+          const openCoverModal = async () =>
             (await wc
               .executeJavaScript(
                 "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const e=[...document.querySelectorAll('.xigua-poster-editor .fake-upload-trigger,.xigua-poster-editor [class*=upload-trigger]')].find(visible);if(!e)return false;(e.closest('button,[role=button]')||e).click();return true})()",
@@ -1306,6 +1352,7 @@ export class BrowserManager {
               false,
               false,
             ));
+          const coverModalOpened = await openCoverModal();
           if (!coverModalOpened) throw new Error("未找到头条上传封面入口");
           await sleep(1200);
           let localCoverInput = await this.waitForMatchingFileInput(
@@ -1336,6 +1383,65 @@ export class BrowserManager {
               return false;
             };
             await waitParsingDone();
+            // 帧时间显示 00:00 说明弹窗里的视频帧还没渲染出来，此时点
+            // 下一步只会原地不动（2026-11-04 两批实证）。先等 video 元素
+            // duration>0 或弹窗内出现非 00:00 的时间；44 秒仍未就绪就关
+            // 弹窗重开一次再等 30 秒——重开后播放器会重新拉流。
+            const probeFrameReady = async () =>
+              (await wc
+                .executeJavaScript(
+                  "(()=>{const videos=[...document.querySelectorAll('video')].filter(v=>v.getClientRects?.().length>0);const vInfo=videos.map(v=>({rs:v.readyState,dur:Number.isFinite(v.duration)?Math.round(v.duration*10)/10:-1,err:v.error?v.error.code:0}));if(videos.some(v=>Number.isFinite(v.duration)&&v.duration>0&&v.readyState>=1))return{ready:true,why:'video',vInfo};const dialogs=[...document.querySelectorAll('[class*=modal],[class*=Modal],[class*=dialog],[class*=Dialog],[role=dialog]')].map(e=>e.innerText||'').join('\\n');const times=(dialogs.match(/\\d{1,2}:\\d{2}/g)||[]).slice(0,8);const nonzero=times.filter(t=>t!=='00:00'&&t!=='0:00');if(nonzero.length>0)return{ready:true,why:'time',vInfo,times};const body=document.body?.innerText||'';const pair=body.match(/(\\d{1,2}):(\\d{2})\\s*\\/\\s*(\\d{1,2}):(\\d{2})/);if(pair&&(pair[1]!=='00'||pair[2]!=='00'||pair[3]!=='00'||pair[4]!=='00'))return{ready:true,why:'player',vInfo,pair:pair[0]};return{ready:false,why:'none',vInfo,times,dialog:dialogs.slice(0,300)}})()",
+                )
+                .catch(() => ({ ready: false, why: "error", vInfo: [] }))) as {
+                ready: boolean;
+                why: string;
+                vInfo: Array<{ rs: number; dur: number; err: number }>;
+                times?: string[];
+                dialog?: string;
+              };
+            let frameReady = await probeFrameReady();
+            let frameWaits = 0;
+            while (!frameReady.ready && frameWaits < 22) {
+              frameWaits++;
+              await sleep(2000);
+              frameReady = await probeFrameReady();
+            }
+            if (!frameReady.ready) {
+              await writeBrowserLog(
+                "toutiao-cover-frame-stuck " +
+                  JSON.stringify(frameReady).slice(0, 2000),
+              );
+              const closed = await this.clickButtonByText(
+                wc,
+                ["取消", "关闭"],
+                false,
+                false,
+              );
+              if (!closed)
+                await wc
+                  .executeJavaScript(
+                    "(()=>{const e=[...document.querySelectorAll('[class*=close],[class*=Close],[aria-label*=关闭]')].filter(e=>e.getClientRects?.().length>0)[0];if(!e)return false;e.click();return true})()",
+                  )
+                  .catch(() => false);
+              await sleep(2500);
+              const reopened = await openCoverModal();
+              await writeBrowserLog(
+                "toutiao-cover-modal-reopen " + String(reopened),
+              );
+              if (reopened) {
+                await sleep(1500);
+                await waitParsingDone();
+                for (let wait = 0; wait < 15; wait++) {
+                  frameReady = await probeFrameReady();
+                  if (frameReady.ready) break;
+                  await sleep(2000);
+                }
+              }
+            }
+            await writeBrowserLog(
+              "toutiao-cover-frame-ready " +
+                JSON.stringify(frameReady).slice(0, 800),
+            );
             const frameNext = await this.clickButtonByText(
               wc,
               ["下一步"],
@@ -1854,6 +1960,77 @@ export class BrowserManager {
             JSON.stringify({ clicked, url: wc.getURL() }) +
             (clickDiagnostics ? " " + clickDiagnostics.slice(0, 6000) : ""),
         );
+        // 点击后必须出现跳转（成功页/管理页）或"发布成功"文本，否则视为
+        // 未提交：抖音在上传未完成时会静默忽略发布点击（2026-11-04 两批
+        // 实证：clicked=true 但发布 POST 从未发出）。未跳转时抓现场并用
+        // CDP 真实鼠标事件重试一次。
+        if (clicked) {
+          const published = async () => {
+            if (!/\/content\/post\/video/.test(wc.getURL())) return true;
+            return await wc
+              .executeJavaScript(
+                "/发布成功|上传成功|作品已发布/.test(document.body?.innerText||'')",
+              )
+              .catch(() => false);
+          };
+          let submitted = false;
+          for (let wait = 0; wait < 8 && !submitted; wait++) {
+            await sleep(2500);
+            submitted = await published();
+          }
+          if (!submitted) {
+            const stuckDiag = await wc
+              .executeJavaScript(
+                "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0;return JSON.stringify({url:location.href,videos:[...document.querySelectorAll('video')].map(v=>({rs:v.readyState,dur:Number.isFinite(v.duration)?Math.round(v.duration):-1})),buttons:[...document.querySelectorAll('button')].filter(e=>visible(e)&&(e.textContent||'').trim().length<10).map(e=>({text:(e.textContent||'').trim(),disabled:!!e.disabled})).slice(-20),hints:[...document.querySelectorAll('div,span,p')].filter(visible).map(e=>(e.textContent||'').trim()).filter(t=>t&&t.length<120&&/上传|发布|请|必填|失败|错误|稍候|稍后|审核/.test(t)).slice(-15),body:(document.body?.innerText||'').slice(0,2500)})})()",
+              )
+              .catch((error) => String(error));
+            await writeBrowserLog(
+              "douyin-publish-stuck " +
+                String(stuckDiag).slice(0, 6000),
+            );
+            const rect = await wc
+              .executeJavaScript(
+                "(()=>{const buttons=[...document.querySelectorAll('button')].filter(button=>(button.textContent||'').trim()==='发布'&&!button.disabled);const target=buttons.at(-1);if(!target)return null;target.scrollIntoView({block:'center'});const r=target.getBoundingClientRect();return{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)}})()",
+              )
+              .catch(() => null);
+            if (rect && Number.isFinite(rect.x)) {
+              if (!wc.debugger.isAttached()) await wc.debugger.attach("1.3");
+              await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+                type: "mouseMoved",
+                x: rect.x,
+                y: rect.y,
+              });
+              await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+                type: "mousePressed",
+                x: rect.x,
+                y: rect.y,
+                button: "left",
+                buttons: 1,
+                clickCount: 1,
+              });
+              await sleep(120);
+              await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+                type: "mouseReleased",
+                x: rect.x,
+                y: rect.y,
+                button: "left",
+                buttons: 0,
+                clickCount: 1,
+              });
+              await writeBrowserLog(
+                "douyin-publish-retry-mouse " + JSON.stringify(rect),
+              );
+              for (let wait = 0; wait < 8 && !submitted; wait++) {
+                await sleep(2500);
+                submitted = await published();
+              }
+            }
+            if (!submitted)
+              await writeBrowserLog(
+                "douyin-publish-no-submit url=" + wc.getURL(),
+              );
+          }
+        }
         await sleep(4000);
         const douyinToasts = await wc
           .executeJavaScript(
@@ -2888,6 +3065,7 @@ export class BrowserManager {
           nodeId: number;
           score: number;
           order: number;
+          info?: string;
         }> = [];
         for (const [order, node] of nodes.entries()) {
           if (node.nodeName !== "INPUT") continue;
@@ -2919,6 +3097,10 @@ export class BrowserManager {
             nodeId: node.backendNodeId || node.nodeId,
             score,
             order,
+            info:
+              (values.get("accept") || "") +
+              " | " +
+              (node.attributes || []).join(" ").slice(0, 200),
           });
         }
         candidates.sort((a, b) => a.score - b.score || a.order - b.order);
@@ -3010,19 +3192,33 @@ export class BrowserManager {
         }
         if (!inputNodeId) {
           const currentInput = await this.waitForBilibiliVideoInput(wc, 10000);
-          if (currentInput) inputNodeId = currentInput.nodeId;
+          if (currentInput) {
+            inputNodeId = currentInput.nodeId;
+            void writeBrowserLog(
+              "bilibili-input-picked " +
+                JSON.stringify({
+                  attempt,
+                  score: currentInput.score,
+                  info: currentInput.info,
+                }).slice(0, 600),
+            );
+          }
         }
         if (!inputNodeId)
           throw new Error("Bilibili current video upload control not found");
         await this.setFileInput(wc, inputNodeId, [file]);
         // 文件选择器拦截路径失效时（2026-11-03 实证：按钮点击了但
         // chooser 从未打开），直接绑定 input 后页面不会自己响应——
-        // 必须手动派发 change/input 事件驱动上传
-        await wc
+        // 必须手动派发 change/input 事件驱动上传。waitForBilibiliVideoInput
+        // 用 DOM.getFlattenedDocument(pierce:true) 找 input，可能命中
+        // shadow DOM / iframe 里的节点，因此派发必须穿透 shadow root
+        // 与同源 iframe，否则页面根本收不到事件（2026-11-04 实证：
+        // 文件已设但页面始终停在 landing）
+        const dispatched = await wc
           .executeJavaScript(
-            "(()=>{for(const input of document.querySelectorAll('input[type=file]')){input.dispatchEvent(new Event('change',{bubbles:true}));input.dispatchEvent(new Event('input',{bubbles:true}))}return true})()",
+            "(()=>{let count=0;const fire=root=>{for(const inp of root.querySelectorAll('input[type=file]')){inp.dispatchEvent(new Event('change',{bubbles:true}));inp.dispatchEvent(new Event('input',{bubbles:true}));count++}for(const el of root.querySelectorAll('*'))if(el.shadowRoot)fire(el.shadowRoot)};fire(document);for(const f of document.querySelectorAll('iframe,frame')){try{if(f.contentDocument&&f.contentDocument!==document)fire(f.contentDocument)}catch(e){}}return count})()",
           )
-          .catch(() => undefined);
+          .catch(() => -1);
         const uploadStart = await this.waitForBilibiliUploadStart(wc, 25000);
         // 上传未开始时落盘页面现场：被点元素、全部 file input、页面文本，
         // 用于定位"点击了但选择器不开/文件已设但页面不响应"的差异
@@ -3030,7 +3226,7 @@ export class BrowserManager {
         if (!uploadStart.started) {
           missingDiag = await wc
             .executeJavaScript(
-              "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0;return JSON.stringify({url:location.href,buttons:[...document.querySelectorAll('button,[role=button],div[class*=upload],span[class*=upload]')].filter(e=>visible(e)&&/上传|选择|拖拽/.test((e.textContent||'').trim())&&(e.textContent||'').trim().length<24).map(e=>({tag:e.tagName,text:(e.textContent||'').trim().slice(0,24),cls:String(e.className||'').slice(0,90)})).slice(0,12),fileInputs:[...document.querySelectorAll('input[type=file]')].map(e=>({accept:e.accept||'',visible:visible(e),cls:String(e.className||'').slice(0,60)})),body:(document.body?.innerText||'').slice(0,1500)}))()",
+              "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0;return JSON.stringify({url:location.href,buttons:[...document.querySelectorAll('button,[role=button],div[class*=upload],span[class*=upload]')].filter(e=>visible(e)&&/上传|选择|拖拽/.test((e.textContent||'').trim())&&(e.textContent||'').trim().length<24).map(e=>({tag:e.tagName,text:(e.textContent||'').trim().slice(0,24),cls:String(e.className||'').slice(0,90)})).slice(0,12),fileInputs:[...document.querySelectorAll('input[type=file]')].map(e=>({accept:e.accept||'',visible:visible(e),cls:String(e.className||'').slice(0,60)})),body:(document.body?.innerText||'').slice(0,1500)})})()",
             )
             .catch((error) => "诊断失败：" + String(error));
         }
@@ -3041,6 +3237,7 @@ export class BrowserManager {
               clicked,
               fallbackClicked,
               usedChooser: chooserNodeId !== undefined,
+              dispatched,
               ...uploadStart,
               diag: missingDiag || undefined,
             }).slice(0, 6000),
@@ -4167,7 +4364,7 @@ export class BrowserManager {
         continue;
       }
       const state = await wc.executeJavaScript(
-        "(()=>{const visible=e=>!!e&&e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';const roots=[document],nodes=[];for(let i=0;i<roots.length;i++){for(const e of roots[i].querySelectorAll('*')){nodes.push(e);if(e.shadowRoot)roots.push(e.shadowRoot)}}const text=roots.map(root=>root===document?(document.body?.innerText||''):(root.textContent||'')).join(' ');const buttons=nodes.filter(e=>e.matches?.('button,[role=button],div,span')&&visible(e));const videos=nodes.filter(e=>e.tagName==='VIDEO');const challenge=/扫码登录|验证码|安全验证|重新登录/.test(text);const uploading=/上传中|正在上传|转码中|上传进度|文件上传中|处理中/.test(text);const publish=buttons.some(b=>/^(发布|立即发布|确认发布|投稿|立即投稿|提交发布|发表)$/.test((b.textContent||'').trim())&&!b.disabled&&b.getAttribute('aria-disabled')!=='true'&&!String(b.className||'').includes('disabled'));const videoReady=videos.some(v=>(v.currentSrc||v.src||'').includes('finder.video.qq.com')||(Number.isFinite(v.duration)&&v.duration>0&&v.readyState>=1));const uploaded=videoReady||/上传成功|上传完成|视频文件|重新上传|更换视频|移除视频|视频上传信息|封面预览/.test(text);return{challenge,uploading,publish,uploaded,videoReady,text:text.slice(-20000),url:location.href}})()",
+        "(()=>{const visible=e=>!!e&&e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';const roots=[document],nodes=[];for(let i=0;i<roots.length;i++){for(const e of roots[i].querySelectorAll('*')){nodes.push(e);if(e.shadowRoot)roots.push(e.shadowRoot)}}const text=roots.map(root=>root===document?(document.body?.innerText||''):(root.textContent||'')).join(' ');const buttons=nodes.filter(e=>e.matches?.('button,[role=button],div,span')&&visible(e));const videos=nodes.filter(e=>e.tagName==='VIDEO');const challenge=/扫码登录|验证码|安全验证|重新登录/.test(text);const uploading=/上传中|正在上传|转码中|上传进度|文件上传中|处理中/.test(text);const failed=/上传失败|重新上传并/.test(text)&&!/上传成功/.test(text);const publish=buttons.some(b=>/^(发布|立即发布|确认发布|投稿|立即投稿|提交发布|发表)$/.test((b.textContent||'').trim())&&!b.disabled&&b.getAttribute('aria-disabled')!=='true'&&!String(b.className||'').includes('disabled'));const videoReady=videos.some(v=>(v.currentSrc||v.src||'').includes('finder.video.qq.com')||(Number.isFinite(v.duration)&&v.duration>0&&v.readyState>=1));const uploaded=!failed&&(videoReady||/上传成功|上传完成|视频文件|重新上传|更换视频|移除视频|视频上传信息|封面预览/.test(text));return{challenge,uploading,failed,publish,uploaded,videoReady,text:text.slice(-20000),url:location.href}})()",
       );
       if (state.challenge) throw new Error("平台要求登录或安全验证");
       if (
@@ -4176,15 +4373,50 @@ export class BrowserManager {
         /视频文件|重新上传|检测为高清视频/.test(state.text)
       )
         return true;
-      if (platform === "douyin" && state.publish && state.uploaded) return true;
-      if (state.publish && state.uploaded && !state.uploading) return true;
+      // 抖音：必须同时满足 无"上传中"字样 才能点发布。预览视频元素在
+      // 本地渲染后就有 duration，uploaded 会提前为 true；若不等上传完成
+      // 就点发布，平台会静默忽略（2026-11-04 两批实证：clicked=true 但
+      // 发布 POST 从未发出，页面也不跳转）
       if (
-        platform === "toutiao" &&
+        platform === "douyin" &&
         state.publish &&
         !state.uploading &&
-        /上传成功/.test(state.text)
+        state.uploaded
       )
         return true;
+      if (
+        platform !== "toutiao" &&
+        state.publish &&
+        state.uploaded &&
+        !state.uploading
+      )
+        return true;
+      if (platform === "toutiao") {
+        // 头条上传失败时页面会显示"上传失败 + 继续上传/重新上传"，此时
+        // "重新上传"字样会让通用 uploaded 误判为已就绪（2026-11-04 实证：
+        // 8B 视频上传失败后封面流程照常启动）。这里必须等到真正的
+        // "上传成功"，检测到失败就点恢复按钮继续等。
+        if (state.failed) {
+          const recovered = await this.clickButtonByText(
+            wc,
+            ["继续上传", "重新上传"],
+            false,
+            true,
+          );
+          await writeBrowserLog(
+            "toutiao-upload-retry " +
+              JSON.stringify({ recovered, elapsed: Date.now() - start }),
+          );
+          await sleep(3000);
+          continue;
+        }
+        if (
+          state.publish &&
+          !state.uploading &&
+          /上传成功/.test(state.text)
+        )
+          return true;
+      }
       await sleep(1500);
     }
     return false;
