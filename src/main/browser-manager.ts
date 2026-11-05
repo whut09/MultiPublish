@@ -2301,6 +2301,26 @@ export class BrowserManager {
               submittedOk = await bilibiliSubmitted();
             }
           }
+          if (!submittedOk) {
+            // 坐标点击两次都未确认：JS 直点按钮元素本身（页面滚动/浮层
+            // 会让 CDP 坐标落空；React onClick 对程序化 click 同样响应，
+            // 封面弹窗处理器已验证此路径有效）
+            const jsSubmit = await wc
+              .executeJavaScript(
+                "(()=>{const btns=[...document.querySelectorAll('button,[role=button],div,span')].filter(e=>e.getClientRects?.().length>0&&(e.textContent||'').trim()==='立即投稿'&&!e.disabled);const t=btns.at(-1);if(!t)return false;(t.closest('button,[role=button]')||t).click();return true})()",
+              )
+              .catch(() => false);
+            await writeBrowserLog(
+              "bilibili-submit-js-click " + String(jsSubmit),
+            );
+            if (jsSubmit) {
+              for (let wait = 0; wait < 10 && !submittedOk; wait++) {
+                await sleep(3000);
+                await clearBilibiliSubmitDialogs();
+                submittedOk = await bilibiliSubmitted();
+              }
+            }
+          }
           if (!submittedOk)
             await writeBrowserLog(
               "bilibili-submit-no-confirm url=" + wc.getURL(),
@@ -3109,6 +3129,14 @@ export class BrowserManager {
     try {
       const clicked = await this.clickButtonByText(wc, labels, true, true);
       if (!clicked) throw new Error(labels.join("/") + "上传按钮不存在");
+      // 兜底预备：真实 CDP 点击可能被浮层遮挡/坐标偏移而未唤起 chooser
+      // （2026-11-05 头条封面本地上传页签实证：按钮点了但 30s 无 chooser、
+      // 无新 input）。等待 6s 后程序化 click 匹配类型的 file input，
+      // 拦截模式下页面会收到真实 chooser 事件链。
+      const acceptRe = imageMode
+        ? "/(image\\/|\\.(jpg|jpeg|png|webp|gif|bmp))/i"
+        : "/(video\\/|\\.(mp4|flv|avi|wmv|mov|webm|mkv|m4v|mpg|mpeg|ts|rm|rmvb|3gp|f4v))/i";
+      let jsInputClicked = false;
       const start = Date.now();
       while (Date.now() - start < 30000) {
         if (chooserNodeId) {
@@ -3131,6 +3159,19 @@ export class BrowserManager {
         if (target && Date.now() - start > 800) {
           await this.setFileInput(wc, target.nodeId, [file]);
           return;
+        }
+        if (!jsInputClicked && Date.now() - start > 6000) {
+          jsInputClicked = true;
+          const jsClicked = await wc
+            .executeJavaScript(
+              "((re)=>{const all=[...document.querySelectorAll('input[type=file]')];const matched=all.filter(e=>re.test(e.accept||''));const ordered=matched.sort((a,b)=>((b.getClientRects?.().length>0)?1:0)-((a.getClientRects?.().length>0)?1:0));let n=0;for(const t of ordered){try{t.click();n++}catch(e){}}return n})(" +
+                acceptRe +
+                ")",
+            )
+            .catch(() => 0);
+          await writeBrowserLog(
+            "chooser-js-input-click " + String(jsClicked),
+          );
         }
         await sleep(400);
       }
@@ -3516,16 +3557,42 @@ export class BrowserManager {
             // 打开 chooser（拦截模式下会触发 fileChooserOpened）。
             // （2026-11-04 Strata 批次实证：CDP 点击上传按钮但 chooser
             // 三次都没开）
+            // accept 过滤不能只匹配 /video/i：B站 input 的 accept 是
+            // ".mp4,.flv,…" 纯扩展名列表，不含 "video" 字样，旧过滤条件
+            // 永远匹配不到 → 兜底从未生效（2026-11-05 用户批次实证
+            // bilibili-js-input-click false ×3）。改为扩展名列表匹配，
+            // 逐个 click（可见的排前），任一触发 chooser 即被拦截捕获。
             const jsClicked = await wc
               .executeJavaScript(
-                "(()=>{const inputs=[...document.querySelectorAll('input[type=file]')].filter(e=>/video/i.test(e.accept||''));const target=inputs.find(e=>e.getClientRects?.().length>0)||inputs[0];if(!target)return false;target.click();return true})()",
+                "(()=>{const re=/(video\\/|\\.(mp4|flv|avi|wmv|mov|webm|mkv|m4v|mpg|mpeg|ts|rm|rmvb|3gp|f4v|m2ts|mts|m2t|vob|swf|3g2|asf))/i;const all=[...document.querySelectorAll('input[type=file]')];const matched=all.filter(e=>re.test(e.accept||''));const inputs=matched.length?matched:all.filter(e=>!/image/i.test(e.accept||''));const ordered=inputs.sort((a,b)=>((b.getClientRects?.().length>0)?1:0)-((a.getClientRects?.().length>0)?1:0));let n=0;for(const t of ordered){try{t.click();n++}catch(e){}}return n})()",
               )
-              .catch(() => false);
+              .catch(() => 0);
             await writeBrowserLog(
               "bilibili-js-input-click " + String(jsClicked),
             );
             const jsStart = Date.now();
             while (Date.now() - jsStart < 6000) {
+              if (chooserNodeId) {
+                inputNodeId = chooserNodeId;
+                break;
+              }
+              await sleep(200);
+            }
+          }
+          if (!inputNodeId) {
+            // input click 仍无 chooser：直接 JS click 上传容器本身，触发
+            // 页面自己的上传事件链。CDP 坐标点击可能被页面推广浮层遮挡
+            // 落空（2026-11-05 用户批次实证：clicked:true 但 chooser 未开）
+            const wrapHit = await wc
+              .executeJavaScript(
+                "(()=>{const sels=['.upload-area','.bcc-upload-wrapper','.upload-wrp','.bcc-upload.upload'];for(const s of sels){const e=[...document.querySelectorAll(s)].find(e=>e.getClientRects?.().length>0);if(!e)continue;e.click();return s}return ''})()",
+              )
+              .catch(() => "");
+            await writeBrowserLog(
+              "bilibili-wrapper-click " + JSON.stringify(wrapHit),
+            );
+            const wrapStart = Date.now();
+            while (Date.now() - wrapStart < 6000) {
               if (chooserNodeId) {
                 inputNodeId = chooserNodeId;
                 break;
@@ -3601,19 +3668,53 @@ export class BrowserManager {
         if (!inputNodeId)
           throw new Error("Bilibili current video upload control not found");
         await this.setFileInput(wc, inputNodeId, [file]);
-        // 文件选择器拦截路径失效时（2026-11-03 实证：按钮点击了但
-        // chooser 从未打开），直接绑定 input 后页面不会自己响应——
-        // 必须手动派发 change/input 事件驱动上传。waitForBilibiliVideoInput
-        // 用 DOM.getFlattenedDocument(pierce:true) 找 input，可能命中
-        // shadow DOM / iframe 里的节点，因此派发必须穿透 shadow root
-        // 与同源 iframe，否则页面根本收不到事件（2026-11-04 实证：
-        // 文件已设但页面始终停在 landing）
-        const dispatched = await wc
-          .executeJavaScript(
-            "(()=>{let count=0;const fire=root=>{for(const inp of root.querySelectorAll('input[type=file]')){inp.dispatchEvent(new Event('change',{bubbles:true}));inp.dispatchEvent(new Event('input',{bubbles:true}));count++}for(const el of root.querySelectorAll('*'))if(el.shadowRoot)fire(el.shadowRoot)};fire(document);for(const f of document.querySelectorAll('iframe,frame')){try{if(f.contentDocument&&f.contentDocument!==document)fire(f.contentDocument)}catch(e){}}return count})()",
-          )
-          .catch(() => -1);
-        const uploadStart = await this.waitForBilibiliUploadStart(wc, 25000);
+        // 事件派发自适应三段式。旧实现无条件全树派发 change+input：选择器
+        // 拦截路径的原生文件链路 + 手动 change + 手动 input 会让页面收到
+        // 多次"文件已选"事件，B站 每次都追加一个分P（2026-11-05 自测实证：
+        // 单次上传出现 3 个"上传完成"分P，疑似也是历史"分P 跨运行累积"
+        // 的真凶）。改为：原生链路若 6s 内启动上传则一个事件都不多发；
+        // 未启动才用 DOM.resolveNode+callFunctionOn 在目标节点上精准派发
+        // 一次 change（可穿透 shadow DOM/iframe）；仍不启动才回退旧全树
+        // 派发兜底。
+        const dispatchOnceOnNode = async () => {
+          try {
+            const resolved = await wc.debugger.sendCommand("DOM.resolveNode", {
+              backendNodeId: inputNodeId,
+            });
+            const objectId = resolved.object?.objectId;
+            if (!objectId) return -1;
+            const r = await wc.debugger.sendCommand("Runtime.callFunctionOn", {
+              objectId,
+              functionDeclaration:
+                "function(){this.dispatchEvent(new Event('change',{bubbles:true}));return true}",
+              returnByValue: true,
+            });
+            return r.result?.value ? 1 : 0;
+          } catch {
+            return -1;
+          }
+        };
+        let uploadStart = await this.waitForBilibiliUploadStart(wc, 6000);
+        let dispatched = 0; // 0 = 原生链路已自行触发，无需手动事件
+        if (!uploadStart.started) {
+          dispatched = await dispatchOnceOnNode();
+          uploadStart = await this.waitForBilibiliUploadStart(wc, 8000);
+        }
+        if (!uploadStart.started) {
+          // 文件选择器拦截路径失效时（2026-11-03 实证：按钮点击了但
+          // chooser 从未打开），直接绑定 input 后页面不会自己响应——
+          // 必须手动派发 change/input 事件驱动上传。waitForBilibiliVideoInput
+          // 用 DOM.getFlattenedDocument(pierce:true) 找 input，可能命中
+          // shadow DOM / iframe 里的节点，因此派发必须穿透 shadow root
+          // 与同源 iframe，否则页面根本收不到事件（2026-11-04 实证：
+          // 文件已设但页面始终停在 landing）
+          dispatched = await wc
+            .executeJavaScript(
+              "(()=>{let count=0;const fire=root=>{for(const inp of root.querySelectorAll('input[type=file]')){inp.dispatchEvent(new Event('change',{bubbles:true}));inp.dispatchEvent(new Event('input',{bubbles:true}));count++}for(const el of root.querySelectorAll('*'))if(el.shadowRoot)fire(el.shadowRoot)};fire(document);for(const f of document.querySelectorAll('iframe,frame')){try{if(f.contentDocument&&f.contentDocument!==document)fire(f.contentDocument)}catch(e){}}return count})()",
+            )
+            .catch(() => -1);
+          uploadStart = await this.waitForBilibiliUploadStart(wc, 15000);
+        }
         // 上传未开始时落盘页面现场：被点元素、全部 file input、页面文本，
         // 用于定位"点击了但选择器不开/文件已设但页面不响应"的差异
         let missingDiag = "";
