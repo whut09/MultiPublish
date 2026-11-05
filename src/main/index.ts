@@ -383,6 +383,61 @@ async function runInspectSelfTest() {
   }
   return true;
 }
+/**
+ * 视图竞态回归自测：复现 2026-11-05"小红书登录页盖住发布记录页"。
+ * 契约：
+ * 1) show() 进行中用户切页（hide）→ 过期 show 不得把控件挂回主窗口；
+ * 2) hide 之后的重新 show 必须正常挂载（账号页功能不受护栏影响）。
+ */
+async function runViewRaceSelfTest() {
+  if (!process.env.MULTIPUBLISH_VIEW_RACE_SELF_TEST) return false;
+  const reportPath =
+    process.env.MULTIPUBLISH_VIEW_RACE_SELF_TEST_RESULT ||
+    path.join(app.getPath("temp"), "multipublish-view-race-self-test.json");
+  let testWindow: BrowserWindow | undefined;
+  let manager: BrowserManager | undefined;
+  const report = (result: Record<string, unknown>) =>
+    fs.writeFile(reportPath, JSON.stringify(result, null, 2), "utf8");
+  try {
+    const data = store.get();
+    const platform = process.env.MULTIPUBLISH_VIEW_RACE_SELF_TEST_PLATFORM;
+    const account = data.accounts.find((a) =>
+      platform ? a.platform === platform : a.platform === "xiaohongshu",
+    );
+    if (!account) throw new Error("找不到自测平台账号");
+    testWindow = new BrowserWindow({ show: false, width: 1280, height: 900 });
+    manager = new BrowserManager(testWindow, async () => undefined);
+    // 第一步：发起 show 但不等待（模拟小红书探针/任何 await 造成的窗口期）
+    const firstShow = manager.show(account, "home");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    // 第二步：窗口期内用户切页 → hide
+    await manager.hide();
+    await firstShow.catch((error) => String(error));
+    const childrenAfterHide = testWindow.contentView.children.length;
+    // 第三步：hide 之后的重新 show（用户再点账号）必须正常挂载
+    await manager.show(account, "home");
+    const childrenAfterReshow = testWindow.contentView.children.length;
+    const ok = childrenAfterHide === 0 && childrenAfterReshow === 1;
+    await report({
+      ok,
+      platform: account.platform,
+      childrenAfterHide,
+      childrenAfterReshow,
+      createdAt: new Date().toISOString(),
+    });
+    app.exit(ok ? 0 : 2);
+  } catch (error) {
+    await report({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+      createdAt: new Date().toISOString(),
+    }).catch(() => undefined);
+    app.exit(1);
+  } finally {
+    if (testWindow && !testWindow.isDestroyed()) testWindow.destroy();
+  }
+  return true;
+}
 async function createWindow() {
   win = new BrowserWindow({
     width: 1500,
@@ -669,6 +724,7 @@ app.whenReady().then(async () => {
   if (recovery.warning) console.warn(recovery.warning);
   if (await runPublishSelfTest()) return;
   if (await runInspectSelfTest()) return;
+  if (await runViewRaceSelfTest()) return;
   ipc();
   await createWindow();
   app.on("activate", () => {
