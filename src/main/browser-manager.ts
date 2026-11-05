@@ -121,6 +121,9 @@ export class BrowserManager {
   // 自动化发布窗口按账号登记：任务超时/卡死时可以被强制中止并释放。
   private automationWindows = new Map<string, BrowserWindow>();
   private active?: string;
+  // show/hide 竞态护栏序号：hide() 与新 show() 都会前移，使仍在飞行中的
+  // 旧 show() 在 await 恢复后能识别自己已过期（见 show() 内注释）。
+  private showSeq = 0;
   private bounds: BrowserBounds = { x: 280, y: 160, width: 900, height: 650 };
   constructor(
     private win: BrowserWindow,
@@ -217,28 +220,17 @@ export class BrowserManager {
   }
   async show(account: Account, target: "home" | "publish" = "home") {
     const view = this.ensureView(account);
-    // 小红书可见视图挂发布请求探针：用户在可见发布页手动发布时，
-    // 抓取带"声明原创"状态的完整请求体，用于确定原创字段的真实名称
-    // （自动勾选已证实 DOM 生效但 React 状态不进 payload，注入方案
-    // 需要先拿到字段名，不能猜）
-    if (
-      account.platform === "xiaohongshu" &&
-      !this.xhsViewProbes.has(account.id)
-    ) {
-      const listener = await this.installPublishRequestProbe(
-        view.webContents,
-        "xiaohongshu-view",
+    // 竞态护栏：show 与 hide 之间不允许"过期 show"把控件重新挂回主窗口。
+    // 序号在每次 hide() 与后续 show() 时前移，show 链路中任何 await 之后
+    // 都要复核；否则异步窗口期内用户切页（hide 已跑）后，show 恢复执行
+    // 仍会无条件 addChildView，把平台页面（如小红书登录页）盖到当前页上
+    // （2026-11-05 发布记录页被小红书登录页覆盖的实证根因）。
+    const seq = ++this.showSeq;
+    if (seq !== this.showSeq) {
+      void writeBrowserLog(
+        "show-superseded account=" + account.id + " target=" + target,
       );
-      if (listener) {
-        this.xhsViewProbes.set(account.id, listener);
-        view.webContents.once("destroyed", () => {
-          const l = this.xhsViewProbes.get(account.id);
-          if (l) {
-            view.webContents.debugger.removeListener("message", l);
-            this.xhsViewProbes.delete(account.id);
-          }
-        });
-      }
+      return;
     }
     if (this.active && this.active !== account.id) {
       const old = this.views.get(this.active);
@@ -248,6 +240,38 @@ export class BrowserManager {
       this.win.contentView.addChildView(view);
     this.active = account.id;
     view.setBounds(this.bounds);
+    // 小红书可见视图挂发布请求探针：用户在可见发布页手动发布时，
+    // 抓取带"声明原创"状态的完整请求体，用于确定原创字段的真实名称
+    // （自动勾选已证实 DOM 生效但 React 状态不进 payload，注入方案
+    // 需要先拿到字段名，不能猜）。
+    // 必须在挂载之后异步安装：曾 await 在挂载之前，Network.enable 挂满
+    // 10s 超时，期间视图未上屏、hide 拦不住恢复后的 attach，登录页直接
+    // 盖到了发布记录页上（2026-11-05 实证，create→show 相差 10.006s）。
+    if (
+      account.platform === "xiaohongshu" &&
+      !this.xhsViewProbes.has(account.id)
+    ) {
+      void this.installPublishRequestProbe(
+        view.webContents,
+        "xiaohongshu-view",
+      )
+        .then((listener) => {
+          if (!listener || view.webContents.isDestroyed()) return;
+          this.xhsViewProbes.set(account.id, listener);
+          view.webContents.once("destroyed", () => {
+            const l = this.xhsViewProbes.get(account.id);
+            if (l) {
+              view.webContents.debugger.removeListener("message", l);
+              this.xhsViewProbes.delete(account.id);
+            }
+          });
+        })
+        .catch((error) =>
+          void writeBrowserLog(
+            "xiaohongshu-view-probe-failed " + String(error),
+          ),
+        );
+    }
     const p = platformMap[account.platform];
     void writeBrowserLog(
       `show account=${account.id} target=${target} current=${view.webContents.getURL()}`,
@@ -263,6 +287,18 @@ export class BrowserManager {
             ? p.publishUrl
             : p.homeUrl,
       );
+    // loadURL 是真实 await 点：期间用户可能已切页（hide 前移了序号）。
+    // 过期 show 不得再做登录检测等收尾动作，直接结束。
+    if (seq !== this.showSeq) {
+      void writeBrowserLog(
+        "show-superseded account=" +
+          account.id +
+          " target=" +
+          target +
+          " stage=post-load",
+      );
+      return;
+    }
     await this.updateAccount(account.id, { loginStatus: "checking" });
     await sleep(1000);
     await this.inspectAccount(account, view);
@@ -5283,6 +5319,20 @@ export class BrowserManager {
     )
       return;
     if (state.pending) {
+      // 视图已从主窗口摘除时停止轮询：登录态由下次 show() 重新触发检测。
+      // 否则分离视图（如掉登录的小红书页）会每 1.8s 永久轮询，
+      // 单日刷出 5.7 万条 login-pending 日志（2026-11-05 实证）。
+      if (
+        this.win.isDestroyed() ||
+        !this.win.contentView.children.includes(view)
+      ) {
+        void writeBrowserLog(
+          "login-inspect-stopped account=" +
+            account.id +
+            " reason=view-detached",
+        );
+        return;
+      }
       void writeBrowserLog(
         `login-pending account=${account.id} url=${view.webContents.getURL()}`,
       );
@@ -5316,6 +5366,8 @@ export class BrowserManager {
     );
   }
   hide() {
+    // 使飞行中的 show() 失效：hide 之后恢复的 show 不得把控件重新挂回。
+    this.showSeq++;
     if (!this.active) return;
     const v = this.views.get(this.active);
     if (v && this.win.contentView.children.includes(v))
