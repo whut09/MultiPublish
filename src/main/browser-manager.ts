@@ -1145,6 +1145,17 @@ export class BrowserManager {
             }
           }
         }
+        // 上游根因修复（2026-11-06 Gemini 批次实证）：原下拉坐标点击
+        // 常设不上值，日志 bilibili-declaration-state value:"" 连续为空，
+        // 提交时平台报"请添加创作声明"并拒绝投稿。统一走
+        // selectBilibiliDeclaration 的隐藏 li 点击（force 主动补选）
+        if (!declarationValue) {
+          const ensured = await this.selectBilibiliDeclaration(wc, true);
+          if (ensured.value) {
+            declarationValue = ensured.value;
+            declarationClick = true;
+          }
+        }
         if (!declarationClick || !declarationValue)
           await writeBrowserLog(
             "bilibili declaration selection unavailable; continuing with platform default " +
@@ -1397,6 +1408,11 @@ export class BrowserManager {
       ) {
         if (account.platform === "toutiao") {
           try {
+          // 自测钩子：强制复现用户环境的封面死路（帧不出图、本地页签
+          // 无 input、chooser 不弹），用于真实验证"跳过封面继续发布"
+          // 兜底分支，仅在显式设置环境变量时生效
+          const coverForceFail =
+            process.env.MULTIPUBLISH_TOUTIAO_COVER_FORCE_FAIL === "1";
           const coverBefore = await wc
             .executeJavaScript(
               "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';return JSON.stringify({url:location.href,body:(document.body?.innerText||'').slice(-14000),controls:[...document.querySelectorAll('button,[role=button],a,input,textarea,[contenteditable=true],div,span,label')].filter(visible).map(e=>({tag:e.tagName,text:(e.textContent||'').trim().slice(0,240),aria:e.getAttribute('aria-label'),title:e.getAttribute('title'),placeholder:e.getAttribute('placeholder'),type:e.getAttribute('type'),disabled:!!e.disabled,cls:String(e.className||'').slice(0,180)})).filter(e=>e.text||e.aria||e.title||e.placeholder).slice(-400)})})()",
@@ -1418,12 +1434,14 @@ export class BrowserManager {
           const coverModalOpened = await openCoverModal();
           if (!coverModalOpened) throw new Error("未找到头条上传封面入口");
           await sleep(1200);
-          let localCoverInput = await this.waitForMatchingFileInput(
-            wc,
-            "image",
-            2500,
-            [videoNodeId],
-          );
+          let localCoverInput = coverForceFail
+            ? undefined
+            : await this.waitForMatchingFileInput(
+                wc,
+                "image",
+                2500,
+                [videoNodeId],
+              );
           let confirmedViaFrame = false;
           // 帧卡死逃生通道里已通过 chooser 预先设置封面图时为 true，
           // 末尾的 setFileInput/chooseFileFromButton 需要跳过
@@ -1471,7 +1489,7 @@ export class BrowserManager {
             // 是服务端缩略图，要等平台把视频转码完才会出图（2026-11-06
             // 文心批次实证：44 秒 + 重开再等 30 秒全 miss，弹窗内帧始终
             // 00:00）。等待窗口放宽到 120 秒，给转码留足时间
-            while (!frameReady.ready && frameWaits < 60) {
+            while (!frameReady.ready && frameWaits < (coverForceFail ? 1 : 60)) {
               frameWaits++;
               await sleep(2000);
               frameReady = await probeFrameReady();
@@ -1485,7 +1503,7 @@ export class BrowserManager {
               // 部分视频的帧始终不渲染（2026-11-04 MIT 视频实证：关弹窗
               // 重开后仍 00:00，点下一步原地不动），此时本地封面图是唯一
               // 可靠路径
-              if (draft.coverPath) {
+              if (draft.coverPath && !coverForceFail) {
                 const localTab = await this.clickButtonByText(
                   wc,
                   ["本地上传"],
@@ -1536,7 +1554,7 @@ export class BrowserManager {
                   }
                 }
               }
-              if (!localCoverInput) {
+              if (!localCoverInput && !coverForceFail) {
                 // 本地通道不可用才走原重开逻辑
                 const closed = await this.clickButtonByText(
                   wc,
@@ -1592,7 +1610,7 @@ export class BrowserManager {
               // 点下一步弹窗会原地不动。每轮点完检查是否出现确认按钮，
               // 未前进就再点下一步，最多 10 轮（转码可能在重试期间完成，
               // 2026-11-06 文心批次实证帧就绪普遍晚于弹窗打开 2 分钟以上）
-              for (let retry = 0; retry < 10; retry++) {
+              for (let retry = 0; retry < (coverForceFail ? 2 : 10); retry++) {
                 await sleep(3000);
                 const confirmVisible = await wc
                   .executeJavaScript(
@@ -1652,13 +1670,15 @@ export class BrowserManager {
             await this.clickButtonByText(wc, ["下一步"], true, true);
             await sleep(1000);
           }
-          let editorConfirmed = await this.clickButtonByText(
-            wc,
-            ["裁剪完成", "完成", "确定", "保存"],
-            true,
-            true,
-          );
-          if (!editorConfirmed && confirmedViaFrame) {
+          let editorConfirmed = coverForceFail
+            ? false
+            : await this.clickButtonByText(
+                wc,
+                ["裁剪完成", "完成", "确定", "保存"],
+                true,
+                true,
+              );
+          if (!editorConfirmed && confirmedViaFrame && !coverForceFail) {
             await sleep(1200);
             editorConfirmed = await this.clickButtonByText(
               wc,
@@ -1713,9 +1733,12 @@ export class BrowserManager {
             );
           }
           } catch (error) {
-            // Toutiao marks the cover as required: submitting without one is
-            // silently rejected by the platform, so a failed cover flow must
-            // fail the task with the real reason instead of skipping ahead.
+            // 2026-11-06 Gemini 批次实证：封面帧永远不出图（服务端缩略图
+            // vInfo:[] / 00:00），本地上传页签无匹配 input、chooser 不弹，
+            // 弹窗里再怎么重试都不可能出现确认按钮。此前直接 throw 会让
+            // 整批硬失败，而页面文案只是"清晰美观的封面有利于推荐"——
+            // 封面并非强制项。最后一搏注入封面图，随后关弹窗继续提交，
+            // 由平台与后台验真决定成败，不再卡死在封面这一步。
             const coverFailureState = await wc
               .executeJavaScript(
                 "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const nodes=[...document.querySelectorAll('button,[role=button],a,input,textarea,[contenteditable=true],div,span,label')].filter(visible);return JSON.stringify({url:location.href,body:(document.body?.innerText||'').slice(-12000),controls:nodes.map(e=>({tag:e.tagName,text:(e.textContent||'').trim().slice(0,300),aria:e.getAttribute('aria-label'),title:e.getAttribute('title'),placeholder:e.getAttribute('placeholder'),type:e.getAttribute('type'),disabled:!!e.disabled,cls:String(e.className||'').slice(0,200)})).filter(e=>e.text||e.aria||e.title||e.placeholder).slice(-300)})})()",
@@ -1727,9 +1750,21 @@ export class BrowserManager {
                 " state=" +
                 coverFailureState.slice(0, 16000),
             );
-            throw error instanceof Error
-              ? error
-              : new Error(String(error));
+            if (draft.coverPath)
+              await this.injectToutiaoCover(
+                wc,
+                draft.coverPath,
+                videoNodeId,
+              );
+            // 关掉封面弹窗，避免遮罩挡住发布按钮
+            await this.clickButtonByText(wc, ["取消", "关闭"], false, false);
+            await wc
+              .executeJavaScript(
+                "(()=>{const e=[...document.querySelectorAll('[class*=close],[class*=Close],[aria-label*=关闭]')].filter(e=>e.getClientRects?.().length>0)[0];if(!e)return false;e.click();return true})()",
+              )
+              .catch(() => false);
+            await sleep(1200);
+            await writeBrowserLog("toutiao-cover-continue reason=cover-not-required");
           }
         } else {
           const nearbyCover =
@@ -2271,6 +2306,18 @@ export class BrowserManager {
           // 分不清僵尸稿和我们刚上传的分P，误删会清空稿件并丢失分区
           // （2026-11-04 MIT 终验实证：误删后"请选择分区"）
           await clearBilibiliSubmitDialogs();
+          // 创作声明未选是"点击无反应"的真实原因（2026-11-06 Gemini 批次
+          // 页面文本实证："请添加创作声明"）。先补选再重投，避免把校验
+          // 失败当成"稿件列表延迟"去反复验真，白等 6.5 分钟
+          const declaration = await this.selectBilibiliDeclaration(wc);
+          if (declaration.fixed) {
+            await this.clickButtonByText(wc, ["立即投稿"], true, false);
+            for (let wait = 0; wait < 10 && !submittedOk; wait++) {
+              await sleep(3000);
+              await clearBilibiliSubmitDialogs();
+              submittedOk = await bilibiliSubmitted();
+            }
+          }
           if (!submittedOk)
             await this.clickButtonByText(
               wc,
@@ -3451,6 +3498,78 @@ export class BrowserManager {
   // shadow DOM），排除带草稿/历史稿祖先标记的陈旧节点。chooser 永不
   // 弹开时（2026-11-06 用户批次实证），单点设置可能押错 input——真正
   // 绑定上传组件的未必是可见/评分最高的那个，必须逐个覆盖。
+  // 2026-11-06 Gemini 批次实证：B站投稿页强制要求「创作声明」，
+  // 未选择时点击立即投稿会被平台直接拒绝，页面停在 frame 并提示
+  // "请添加创作声明"，鼠标/JS 重试都无效，后续所有后台验真必然
+  // miss（此前误判为"稿件列表延迟"）。补选"内容无需标注"即可提交。
+  // 2026-11-06 Gemini 批次实证：B站强制「创作声明」，未选时提交被拒
+  // 并提示"请添加创作声明"，页面停在 frame，后续所有验真必然 miss。
+  // 声明下拉 .bcc-select-list-wrap 常态 display:none，选项 li.bcc-option
+  // 一直在 DOM 里但不可见——任何"可见元素"过滤都找不到它，坐标点击
+  // 展开也不可靠。直接对隐藏 li 派发 click（Vue 监听与可见性无关），
+  // 再回读 input.value 确认真的设上了。
+  async selectBilibiliDeclaration(wc: Electron.WebContents, force = false) {
+    const probeMode =
+      process.env.MULTIPUBLISH_BILIBILI_DECLARATION_PROBE === "1";
+    const warning = (await wc
+      .executeJavaScript(
+        "/请添加创作声明|请选择创作声明|创作声明不能为空/.test(document.body?.innerText||'')",
+      )
+      .catch(() => false)) as boolean;
+    if (!probeMode && !force && !warning)
+      return { needed: false, fixed: false, found: false };
+    // 幂等：已设上值就不重复点击（避免覆盖用户/产品已选的声明类型）
+    const beforeValue = (await wc
+      .executeJavaScript(
+        "(()=>{const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const i=all(document).find(e=>e.tagName==='INPUT'&&/创作声明/.test(e.placeholder||''));return i?(i.value||''):''})()",
+      )
+      .catch(() => "")) as string;
+    if (beforeValue && !probeMode)
+      return { needed: false, fixed: true, found: true, value: beforeValue };
+    const clicked = (await wc
+      .executeJavaScript(
+        "(()=>{const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const items=all(document).filter(e=>{const c=String(e.className||'');return /bcc-option/.test(c)&&(e.tagName==='LI'||e.tagName==='SPAN')});const pick=t=>items.find(e=>e.tagName==='LI'&&(e.textContent||'').trim()===t)||items.find(e=>(e.textContent||'').trim()===t);const target=pick('含AI生成内容')||pick('内容无需标注')||items.find(e=>e.tagName==='LI');if(!target)return{found:false,items:items.length};target.click();return{found:true,text:(target.textContent||'').trim(),tag:target.tagName,cls:String(target.className||''),items:items.length}})()",
+      )
+      .catch(() => ({ found: false }))) as {
+      found: boolean;
+      text?: string;
+      items?: number;
+    };
+    await sleep(900);
+    const state = (await wc
+      .executeJavaScript(
+        "(()=>{const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const i=all(document).find(e=>e.tagName==='INPUT'&&/创作声明/.test(e.placeholder||''));return{value:i?(i.value||''):'',warning:/请添加创作声明|请选择创作声明|创作声明不能为空/.test(document.body?.innerText||'')}})()",
+      )
+      .catch(() => ({ value: "", warning: false }))) as {
+      value: string;
+      warning: boolean;
+    };
+    await writeBrowserLog(
+      "bilibili-declaration " +
+        JSON.stringify({
+          ...clicked,
+          beforeValue,
+          warningBefore: warning,
+          ...state,
+          probeMode,
+          force,
+        }),
+    );
+    // 探针模式只验证"能点中并写入声明"，不改变发布流程判断
+    if (probeMode)
+      return {
+        needed: true,
+        fixed: false,
+        found: clicked.found && !!state.value,
+        value: state.value,
+      };
+    return {
+      needed: true,
+      fixed: !!state.value || !state.warning,
+      found: clicked.found,
+      value: state.value,
+    };
+  }
   private async listBilibiliVideoInputNodes(wc: Electron.WebContents) {
     try {
       if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
@@ -4430,6 +4549,63 @@ export class BrowserManager {
         });
     }
     return result;
+  }
+  // 头条封面弹窗"本地上传"页签经常找不到 accept=image 的控件：
+  // waitForMatchingFileInput 只认 /image/i，平台可能用空 accept 或
+  // ".jpg,.png" 扩展名列表；而 chooser 拦截在本机不弹（2026-11-06
+  // Gemini 批次实证 local-input false / local-chooser false）。
+  // 直接 pierce 枚举全部 file input 逐个注入封面图（B站 v0.1.49 同款
+  // 多候选思路），并精确派发 change 让 React 接管上传。
+  private async injectToutiaoCover(
+    wc: Electron.WebContents,
+    coverPath: string,
+    excludeNodeId: number,
+  ) {
+    const inputs = await this.getFileInputs(wc).catch(
+      () => [] as Awaited<ReturnType<typeof this.getFileInputs>>,
+    );
+    await writeBrowserLog(
+      "toutiao-cover-inputs " +
+        JSON.stringify(
+          inputs.map((i) => ({ nodeId: i.nodeId, accept: i.accept })),
+        ).slice(0, 2000),
+    );
+    const candidates = inputs.filter(
+      (i) => i.nodeId !== excludeNodeId && !/video/i.test(i.accept),
+    );
+    for (const input of candidates) {
+      try {
+        await this.setFileInput(wc, input.nodeId, [coverPath]);
+        if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+        const resolved = await wc.debugger.sendCommand("DOM.resolveNode", {
+          backendNodeId: input.nodeId,
+        });
+        const objectId = resolved.object?.objectId;
+        if (objectId)
+          await wc.debugger.sendCommand("Runtime.callFunctionOn", {
+            objectId,
+            functionDeclaration:
+              "function(){this.dispatchEvent(new Event('change',{bubbles:true}));this.dispatchEvent(new Event('input',{bubbles:true}));return true}",
+            returnByValue: true,
+          });
+        await sleep(2500);
+        const applied = await wc
+          .executeJavaScript(
+            "(()=>{const t=document.body?.innerText||'';return /重新上传封面|更换封面|裁剪完成|完成后无法继续编辑/.test(t)||!!document.querySelector('img[src^=\"blob:\"]')})()",
+          )
+          .catch(() => false);
+        await writeBrowserLog(
+          "toutiao-cover-inject " +
+            JSON.stringify({ nodeId: input.nodeId, applied }),
+        );
+        if (applied) return true;
+      } catch (error) {
+        await writeBrowserLog(
+          "toutiao-cover-inject-error " + String(error).slice(0, 200),
+        );
+      }
+    }
+    return false;
   }
   private async setFileInput(
     wc: Electron.WebContents,

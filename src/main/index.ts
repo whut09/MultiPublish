@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, WebContentsView } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -389,6 +389,84 @@ async function runInspectSelfTest() {
  * 1) show() 进行中用户切页（hide）→ 过期 show 不得把控件挂回主窗口；
  * 2) hide 之后的重新 show 必须正常挂载（账号页功能不受护栏影响）。
  */
+// B站创作声明补选的独立验证：只打开投稿页，调用生产方法定位并点击
+// "内容无需标注"，记录点击前后的 DOM，不上传、不发布任何内容。
+async function runBilibiliDeclarationProbe() {
+  if (process.env.MULTIPUBLISH_BILIBILI_DECLARATION_PROBE !== "1")
+    return false;
+  const reportPath =
+    process.env.MULTIPUBLISH_BILIBILI_DECLARATION_PROBE_RESULT ||
+    path.join(app.getPath("temp"), "multipublish-bilibili-declaration.json");
+  let testWindow: BrowserWindow | undefined;
+  try {
+    const account = store.get().accounts.find((item) => item.platform === "bilibili");
+    if (!account) throw new Error("找不到 B站账号");
+    testWindow = new BrowserWindow({
+      show: false,
+      width: 1440,
+      height: 900,
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    });
+    const manager = new BrowserManager(testWindow, async () => undefined);
+    await manager.show(account, "publish");
+    const view = testWindow.contentView.children[0] as
+      | WebContentsView
+      | undefined;
+    if (!view) throw new Error("投稿页视图未挂载");
+    const wc = view.webContents;
+    // 投稿页可能停在上传 landing（"本地浏览器存在1个未提交的视频"），
+    // 此时表单未渲染、没有创作声明；点"继续编辑"恢复草稿进表单再探测。
+    // SPA 渲染有延迟，每轮都重试点击并重新检查
+    let ready = false;
+    let resumed = false;
+    for (let i = 0; i < 45; i++) {
+      resumed =
+        ((await wc
+          .executeJavaScript(
+            "(()=>{const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const c=all(document).filter(e=>{const t=(e.textContent||'').trim();return t.includes('继续编辑')&&t.length<20&&e.children.length<4});c.sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return ar.width*ar.height-br.width*br.height});if(!c[0])return false;(c[0].closest('button,[role=button]')||c[0]).click();return true})()",
+          )
+          .catch(() => false)) as boolean) || resumed;
+      ready = (await wc
+        .executeJavaScript("/创作声明/.test(document.body?.innerText||'')")
+        .catch(() => false)) as boolean;
+      if (ready) break;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    const before = (await wc
+      .executeJavaScript("(document.body?.innerText||'').slice(-400)")
+      .catch(() => "")) as string;
+    const declarationDom = await wc
+      .executeJavaScript(
+        "(()=>{const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const i=all(document).find(e=>e.tagName==='INPUT'&&/创作声明/.test(e.placeholder||''));if(!i)return{found:false,inputs:all(document).filter(e=>e.tagName==='INPUT').map(e=>({p:e.placeholder||'',v:e.value||''})).slice(0,30)};let p=i;for(let k=0;k<4&&p.parentElement;k++)p=p.parentElement;return{found:true,input:i.outerHTML.slice(0,800),area:p.outerHTML.slice(0,5000),text:(p.innerText||'').slice(0,800)}})()",
+      )
+      .catch((error) => String(error));
+    const outcome = await manager.selectBilibiliDeclaration(wc);
+    const report = {
+      ok: ready && !!(outcome as { found?: boolean }).found,
+      ready,
+      resumed,
+      outcome,
+      url: wc.getURL(),
+      bodyTail: before,
+      declarationDom,
+      createdAt: new Date().toISOString(),
+    };
+    await fs.writeFile(reportPath, JSON.stringify(report, null, 2), "utf8");
+    app.exit(report.ok ? 0 : 2);
+  } catch (error) {
+    await fs.writeFile(
+      reportPath,
+      JSON.stringify({ ok: false, error: String(error) }, null, 2),
+      "utf8",
+    );
+    app.exit(2);
+  }
+  return true;
+}
 async function runViewRaceSelfTest() {
   if (!process.env.MULTIPUBLISH_VIEW_RACE_SELF_TEST) return false;
   const reportPath =
@@ -724,6 +802,7 @@ app.whenReady().then(async () => {
   if (recovery.warning) console.warn(recovery.warning);
   if (await runPublishSelfTest()) return;
   if (await runInspectSelfTest()) return;
+  if (await runBilibiliDeclarationProbe()) return;
   if (await runViewRaceSelfTest()) return;
   ipc();
   await createWindow();
