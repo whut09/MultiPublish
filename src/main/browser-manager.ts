@@ -774,27 +774,34 @@ export class BrowserManager {
         // "找不到上传控件"，均为页面未渲染完）。这里先等控件出现。
         const inputs = await this.waitForFileInputs(wc, 60000);
         if (!inputs.length) {
-          // 再给一次机会：等待页面出现任何上传相关元素（最多 30 秒）。
+          // 再给几次机会：等待页面出现任何上传相关元素（最多 90 秒）。
           // SPA 内层出现"应用加载失败，请刷新重试"时（2026-11-04 快手
-          // 实证：外壳正常、内容区加载失败，干等必然超时），自动重载恢复
-          let reloaded = false;
-          for (let wait = 0; wait < 30; wait += 2) {
+          // 实证：外壳正常、内容区加载失败，干等必然超时），自动重载恢复。
+          // 2026-11-05 用户批次实证：单次重载后内层仍失败，需要多轮重载
+          // （每轮之间留出渲染窗口，避免连续 reload 打断加载）。
+          let reloaded = 0;
+          let lastReloadAt = 0;
+          for (let wait = 0; wait < 45; wait += 2) {
             await sleep(2000);
             const retryInputs = await this.waitForFileInputs(wc, 1000);
             if (retryInputs.length) {
               inputs.push(...retryInputs);
               break;
             }
-            if (!reloaded) {
+            if (reloaded < 3 && Date.now() - lastReloadAt > 15000) {
               const broken = await wc
                 .executeJavaScript(
                   "/应用加载失败，请刷新重试|页面加载失败|加载失败，请重试/.test(document.body?.innerText||'')",
                 )
                 .catch(() => false);
               if (broken) {
+                reloaded += 1;
+                lastReloadAt = Date.now();
                 await writeBrowserLog(
                   "spa-app-load-failed-reload " +
                     account.platform +
+                    " round=" +
+                    reloaded +
                     " url=" +
                     wc.getURL(),
                 );
@@ -803,7 +810,6 @@ export class BrowserManager {
                 } catch {
                   // 窗口可能已销毁，忽略
                 }
-                reloaded = true;
               }
             }
           }
@@ -3164,7 +3170,7 @@ export class BrowserManager {
           jsInputClicked = true;
           const jsClicked = await wc
             .executeJavaScript(
-              "((re)=>{const all=[...document.querySelectorAll('input[type=file]')];const matched=all.filter(e=>re.test(e.accept||''));const ordered=matched.sort((a,b)=>((b.getClientRects?.().length>0)?1:0)-((a.getClientRects?.().length>0)?1:0));let n=0;for(const t of ordered){try{t.click();n++}catch(e){}}return n})(" +
+              "((re)=>{const all=root=>{const r=[];for(const e of root.querySelectorAll('input[type=file]'))r.push(e);for(const e of root.querySelectorAll('*'))if(e.shadowRoot)r.push(...all(e.shadowRoot));return r};const matched=all(document).filter(e=>re.test(e.accept||''));const ordered=matched.sort((a,b)=>((b.getClientRects?.().length>0)?1:0)-((a.getClientRects?.().length>0)?1:0));let n=0;for(const t of ordered){try{t.click();n++}catch(e){}}return n})(" +
                 acceptRe +
                 ")",
             )
@@ -3406,6 +3412,59 @@ export class BrowserManager {
     }
     return undefined;
   }
+  // 直连兜底用：枚举页面上全部 video 类 file input 节点（pierce 穿透
+  // shadow DOM），排除带草稿/历史稿祖先标记的陈旧节点。chooser 永不
+  // 弹开时（2026-11-06 用户批次实证），单点设置可能押错 input——真正
+  // 绑定上传组件的未必是可见/评分最高的那个，必须逐个覆盖。
+  private async listBilibiliVideoInputNodes(wc: Electron.WebContents) {
+    try {
+      if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+      await wc.debugger.sendCommand("DOM.enable");
+      const flattened = await wc.debugger.sendCommand(
+        "DOM.getFlattenedDocument",
+        { depth: -1, pierce: true },
+      );
+      const nodes = flattened.nodes as Array<{
+        nodeId: number;
+        backendNodeId?: number;
+        parentId?: number;
+        nodeName: string;
+        attributes?: string[];
+      }>;
+      const byId = new Map(nodes.map((node) => [node.nodeId, node]));
+      const result: number[] = [];
+      for (const node of nodes) {
+        if (node.nodeName !== "INPUT") continue;
+        const attrs = node.attributes || [];
+        const values = new Map<string, string>();
+        for (let index = 0; index < attrs.length; index += 2)
+          values.set(attrs[index], attrs[index + 1] || "");
+        if ((values.get("type") || "").toLowerCase() !== "file") continue;
+        const accept = values.get("accept") || "";
+        if (/image/i.test(accept) && !/video/i.test(accept)) continue;
+        let stale = false;
+        let current: typeof node | undefined = node;
+        for (
+          let depth = 0;
+          current && depth < 10;
+          depth++,
+            current = current.parentId
+              ? byId.get(current.parentId)
+              : undefined
+        ) {
+          const context = (current.attributes || []).join(" ");
+          if (/draft|history|old|stale|草稿|历史|旧稿|已上传/i.test(context)) {
+            stale = true;
+            break;
+          }
+        }
+        if (!stale) result.push(node.backendNodeId || node.nodeId);
+      }
+      return result;
+    } catch {
+      return [];
+    }
+  }
   // After DOM.setFileInputFiles the platform may silently drop the upload and
   // fall back to the video-select landing page. Confirm the upload really
   // started (progress text, editor form, or a rendered video) before trusting
@@ -3564,7 +3623,7 @@ export class BrowserManager {
             // 逐个 click（可见的排前），任一触发 chooser 即被拦截捕获。
             const jsClicked = await wc
               .executeJavaScript(
-                "(()=>{const re=/(video\\/|\\.(mp4|flv|avi|wmv|mov|webm|mkv|m4v|mpg|mpeg|ts|rm|rmvb|3gp|f4v|m2ts|mts|m2t|vob|swf|3g2|asf))/i;const all=[...document.querySelectorAll('input[type=file]')];const matched=all.filter(e=>re.test(e.accept||''));const inputs=matched.length?matched:all.filter(e=>!/image/i.test(e.accept||''));const ordered=inputs.sort((a,b)=>((b.getClientRects?.().length>0)?1:0)-((a.getClientRects?.().length>0)?1:0));let n=0;for(const t of ordered){try{t.click();n++}catch(e){}}return n})()",
+                "(()=>{const re=/(video\\/|\\.(mp4|flv|avi|wmv|mov|webm|mkv|m4v|mpg|mpeg|ts|rm|rmvb|3gp|f4v|m2ts|mts|m2t|vob|swf|3g2|asf))/i;const all=root=>{const r=[];for(const e of root.querySelectorAll('input[type=file]'))r.push(e);for(const e of root.querySelectorAll('*'))if(e.shadowRoot)r.push(...all(e.shadowRoot));return r};const matched=all(document).filter(e=>re.test(e.accept||''));const inputs=matched.length?matched:all(document).filter(e=>!/image/i.test(e.accept||''));const ordered=inputs.sort((a,b)=>((b.getClientRects?.().length>0)?1:0)-((a.getClientRects?.().length>0)?1:0));let n=0;for(const t of ordered){try{t.click();n++}catch(e){}}return n})()",
               )
               .catch(() => 0);
             await writeBrowserLog(
@@ -3667,19 +3726,10 @@ export class BrowserManager {
         }
         if (!inputNodeId)
           throw new Error("Bilibili current video upload control not found");
-        await this.setFileInput(wc, inputNodeId, [file]);
-        // 事件派发自适应三段式。旧实现无条件全树派发 change+input：选择器
-        // 拦截路径的原生文件链路 + 手动 change + 手动 input 会让页面收到
-        // 多次"文件已选"事件，B站 每次都追加一个分P（2026-11-05 自测实证：
-        // 单次上传出现 3 个"上传完成"分P，疑似也是历史"分P 跨运行累积"
-        // 的真凶）。改为：原生链路若 6s 内启动上传则一个事件都不多发；
-        // 未启动才用 DOM.resolveNode+callFunctionOn 在目标节点上精准派发
-        // 一次 change（可穿透 shadow DOM/iframe）；仍不启动才回退旧全树
-        // 派发兜底。
-        const dispatchOnceOnNode = async () => {
+        const dispatchOnceOnNode = async (nodeId: number) => {
           try {
             const resolved = await wc.debugger.sendCommand("DOM.resolveNode", {
-              backendNodeId: inputNodeId,
+              backendNodeId: nodeId,
             });
             const objectId = resolved.object?.objectId;
             if (!objectId) return -1;
@@ -3694,26 +3744,55 @@ export class BrowserManager {
             return -1;
           }
         };
-        let uploadStart = await this.waitForBilibiliUploadStart(wc, 6000);
-        let dispatched = 0; // 0 = 原生链路已自行触发，无需手动事件
-        if (!uploadStart.started) {
-          dispatched = await dispatchOnceOnNode();
-          uploadStart = await this.waitForBilibiliUploadStart(wc, 8000);
+        // 多输入逐一尝试（2026-11-06 用户批次实证：chooser 永不弹开且单点
+        // 设置页面零反应——页面同时存在可见/隐藏多个 video input，真正绑定
+        // 上传组件的未必是被选中那个；chooser 路径打开的是页面自己使用的
+        // input，直连路径必须覆盖全部候选）。选中节点优先，其余按 pierce
+        // 枚举补充，逐个"设文件+自适应派发"，命中即停。
+        const candidateNodeIds = [inputNodeId];
+        for (const nodeId of await this.listBilibiliVideoInputNodes(wc)) {
+          if (!candidateNodeIds.includes(nodeId)) candidateNodeIds.push(nodeId);
         }
-        if (!uploadStart.started) {
-          // 文件选择器拦截路径失效时（2026-11-03 实证：按钮点击了但
-          // chooser 从未打开），直接绑定 input 后页面不会自己响应——
-          // 必须手动派发 change/input 事件驱动上传。waitForBilibiliVideoInput
-          // 用 DOM.getFlattenedDocument(pierce:true) 找 input，可能命中
-          // shadow DOM / iframe 里的节点，因此派发必须穿透 shadow root
-          // 与同源 iframe，否则页面根本收不到事件（2026-11-04 实证：
-          // 文件已设但页面始终停在 landing）
-          dispatched = await wc
-            .executeJavaScript(
-              "(()=>{let count=0;const fire=root=>{for(const inp of root.querySelectorAll('input[type=file]')){inp.dispatchEvent(new Event('change',{bubbles:true}));inp.dispatchEvent(new Event('input',{bubbles:true}));count++}for(const el of root.querySelectorAll('*'))if(el.shadowRoot)fire(el.shadowRoot)};fire(document);for(const f of document.querySelectorAll('iframe,frame')){try{if(f.contentDocument&&f.contentDocument!==document)fire(f.contentDocument)}catch(e){}}return count})()",
-            )
-            .catch(() => -1);
-          uploadStart = await this.waitForBilibiliUploadStart(wc, 15000);
+        await writeBrowserLog(
+          "bilibili-direct-candidates " + JSON.stringify(candidateNodeIds),
+        );
+        let uploadStart = { started: false, evidence: "" };
+        let dispatched = 0;
+        for (const nodeId of candidateNodeIds) {
+          await this.setFileInput(wc, nodeId, [file]);
+          // 自适应三段式：原生链路可能已自行触发 change（多触发会重复
+          // 加分P，2026-11-05 自测实证 3 分P），所以先等 6s，未启动才
+          // 在该节点上精准派发一次 change，仍未启动才回退全树派发。
+          uploadStart = await this.waitForBilibiliUploadStart(wc, 6000);
+          dispatched = 0;
+          if (!uploadStart.started) {
+            dispatched = await dispatchOnceOnNode(nodeId);
+            uploadStart = await this.waitForBilibiliUploadStart(wc, 8000);
+          }
+          if (!uploadStart.started) {
+            // 文件选择器拦截路径失效时（2026-11-03 实证：按钮点击了但
+            // chooser 从未打开），直接绑定 input 后页面不会自己响应——
+            // 必须手动派发 change/input 事件驱动上传。waitForBilibiliVideoInput
+            // 用 DOM.getFlattenedDocument(pierce:true) 找 input，可能命中
+            // shadow DOM / iframe 里的节点，因此派发必须穿透 shadow root
+            // 与同源 iframe，否则页面根本收不到事件（2026-11-04 实证：
+            // 文件已设但页面始终停在 landing）
+            dispatched = await wc
+              .executeJavaScript(
+                "(()=>{let count=0;const fire=root=>{for(const inp of root.querySelectorAll('input[type=file]')){inp.dispatchEvent(new Event('change',{bubbles:true}));inp.dispatchEvent(new Event('input',{bubbles:true}));count++}for(const el of root.querySelectorAll('*'))if(el.shadowRoot)fire(el.shadowRoot)};fire(document);for(const f of document.querySelectorAll('iframe,frame')){try{if(f.contentDocument&&f.contentDocument!==document)fire(f.contentDocument)}catch(e){}}return count})()",
+              )
+              .catch(() => -1);
+            uploadStart = await this.waitForBilibiliUploadStart(wc, 15000);
+          }
+          void writeBrowserLog(
+            "bilibili-direct-try " +
+              JSON.stringify({
+                nodeId,
+                dispatched,
+                started: uploadStart.started,
+              }),
+          );
+          if (uploadStart.started) break;
         }
         // 上传未开始时落盘页面现场：被点元素、全部 file input、页面文本，
         // 用于定位"点击了但选择器不开/文件已设但页面不响应"的差异
