@@ -1467,7 +1467,11 @@ export class BrowserManager {
               };
             let frameReady = await probeFrameReady();
             let frameWaits = 0;
-            while (!frameReady.ready && frameWaits < 22) {
+            // 帧时间 00:00 且弹窗无 video 元素（vInfo:[]）说明封面帧
+            // 是服务端缩略图，要等平台把视频转码完才会出图（2026-11-06
+            // 文心批次实证：44 秒 + 重开再等 30 秒全 miss，弹窗内帧始终
+            // 00:00）。等待窗口放宽到 120 秒，给转码留足时间
+            while (!frameReady.ready && frameWaits < 60) {
               frameWaits++;
               await sleep(2000);
               frameReady = await probeFrameReady();
@@ -1554,7 +1558,10 @@ export class BrowserManager {
                 if (reopened) {
                   await sleep(1500);
                   await waitParsingDone();
-                  for (let wait = 0; wait < 15; wait++) {
+                  // 重开后播放器重新拉流，同样给 120 秒等转码出图
+                  //（2026-11-06 文心批次实证：重开后只等 30 秒即放弃，
+                  // 帧仍 00:00，点下一步原地不动导致封面硬失败）
+                  for (let wait = 0; wait < 60; wait++) {
                     frameReady = await probeFrameReady();
                     if (frameReady.ready) break;
                     await sleep(2000);
@@ -1583,8 +1590,9 @@ export class BrowserManager {
               confirmedViaFrame = true;
               // 自纠错：封面帧未就绪时（帧时间显示 00:00，2026-11-04 实证）
               // 点下一步弹窗会原地不动。每轮点完检查是否出现确认按钮，
-              // 未前进就再点下一步，最多 5 轮
-              for (let retry = 0; retry < 5; retry++) {
+              // 未前进就再点下一步，最多 10 轮（转码可能在重试期间完成，
+              // 2026-11-06 文心批次实证帧就绪普遍晚于弹窗打开 2 分钟以上）
+              for (let retry = 0; retry < 10; retry++) {
                 await sleep(3000);
                 const confirmVisible = await wc
                   .executeJavaScript(
@@ -2425,8 +2433,10 @@ export class BrowserManager {
         draft.title,
         // 抖音：点击发布后平台还要转码处理，作品要几分钟后才出现在
         // 内容管理列表（2026-11-03 实证：180 秒窗口内列表一直没有
-        // 目标作品，任务被误判失败而实际发布成功），验真窗口放宽到 5 分钟
-        account.platform === "douyin" ? 300000 : 180000,
+        // 目标作品，任务被误判失败而实际发布成功）。5 分钟窗口仍不够
+        // （2026-11-06 文心批次实证：发布点击正常、5 分钟到期时平台
+        // 仍在转码），放宽到 10 分钟
+        account.platform === "douyin" ? 600000 : 180000,
       );
       const declarationSuffix = declarationNotes.length
         ? "；" + declarationNotes.join("、")
@@ -2452,7 +2462,7 @@ export class BrowserManager {
           return {
             status: "manual_required" as const,
             message:
-              "抖音发布点击已完成，但作品管理 5 分钟内未出现目标标题（平台可能仍在转码）。请稍后在抖音 App/创作者中心核对：已发布可忽略本任务，未发布请点重新发布" +
+              "抖音发布点击已完成，但作品管理 10 分钟内未出现目标标题（平台可能仍在转码）。请稍后在抖音 App/创作者中心核对：已发布可忽略本任务，未发布请点重新发布" +
               declarationSuffix +
               (evidence ? "；现场截图：" + evidence : ""),
           };
@@ -2511,7 +2521,32 @@ export class BrowserManager {
         // B站稿件列表有延迟，且存在未完成草稿时稿件管理页会重定向回
         // 投稿页，验真窗口内可能看不到已落库的稿件（2026-11-04 Strata
         // 实证：重试提交 15 秒后落库，验真却 miss，下次发布的防重复
-        // 预检才确认"已存在"）。如实转人工核对并给出自愈路径
+        // 预检才确认"已存在"）。
+        // 迟到验真自愈：投稿点击已正常发出（含 js-click 兜底）时，
+        // 稿件大概率已投递，只是列表落库慢（2026-11-06 文心批次实证：
+        // js-click true 后连续 6.5 分钟验真窗口全 miss，稿件实际已
+        // 投递，靠下次发布的防重复预检才确认）。再等 90 秒让列表落库，
+        // 进后台核对 90 秒，命中即判成功，避免把已成功的稿件留给人工
+        await writeBrowserLog("bilibili-late-verify start");
+        await sleep(90000);
+        const lateVerify = await this.verifyPublishedTitle(
+          wc,
+          "bilibili",
+          draft.title,
+          90000,
+        ).catch(() => ({ ok: false, url: wc.getURL(), reason: "error" }));
+        await writeBrowserLog(
+          "bilibili-late-verify ok=" + String(lateVerify.ok),
+        );
+        if (lateVerify.ok)
+          return {
+            status: "success" as const,
+            message:
+              platformMap[account.platform].name +
+              "迟到验真：作品管理已找到目标标题，发布成功：" +
+              lateVerify.url +
+              declarationSuffix,
+          };
         return {
           status: "manual_required" as const,
           message:
