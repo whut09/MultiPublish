@@ -167,7 +167,9 @@ async function runPublishSelfTest() {
     if (!account) throw new Error("找不到平台账号：" + platform);
     if (!draft) throw new Error("找不到可发布草稿");
     testWindow = new BrowserWindow({
-      show: false,
+      // 对照实验：显式显示并聚焦一个前台窗口，模拟用户 GUI 主窗口
+      // 抢焦点的情况（离屏发布窗口因此失焦）
+      show: process.env.MULTIPUBLISH_SELF_TEST_FOREGROUND === "1",
       width: 320,
       height: 240,
       webPreferences: {
@@ -176,6 +178,8 @@ async function runPublishSelfTest() {
         sandbox: true,
       },
     });
+    if (process.env.MULTIPUBLISH_SELF_TEST_FOREGROUND === "1")
+      testWindow.focus();
     manager = new BrowserManager(testWindow, async () => undefined);
     const result = await manager.autoPublish(
       account,
@@ -789,12 +793,11 @@ function ipc() {
     const tasks = store
       .get()
       .tasks.filter((x) => x.draftId === draftId && x.status !== "success");
-    // 2026-11-07：平台自动化所有通过的自测都是"单离屏窗口"，而用户
-    // 3 并发时 chooser 文件对话框、B站风控验证码窗口等需要真实窗口
-    // 交互的环节反复失效（多个失焦透明窗口竞争）。默认串行，一次只
-    // 开一个发布窗口；需要提速时可用环境变量调回并发度。
+    // 2026-11-07 更正：一度改为串行，结果 5 平台排队、半小时才轮到
+    // 第 2 个（MNN 批次实证）。真正导致交互失效的是离屏不可见窗口，
+    // 已在 autoPublish 改为屏幕内可见。并发度恢复为 3，可用环境变量调整。
     const requested = Number(
-      process.env.MULTIPUBLISH_PUBLISH_CONCURRENCY || "1",
+      process.env.MULTIPUBLISH_PUBLISH_CONCURRENCY || "3",
     );
     const concurrency = Math.max(
       1,

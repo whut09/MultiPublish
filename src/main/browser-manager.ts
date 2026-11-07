@@ -359,15 +359,33 @@ export class BrowserManager {
         status: "failed" as const,
         message: "视频文件不存在或为空：" + videoPath,
       };
+    // 发布窗口默认可见（屏幕内、不透明）：离屏 + opacity 0.01 时
+    // Chromium 会丢弃输入手势，CDP 坐标点击不算真实用户点击，导致
+    // 文件选择器不弹、Escape/取消关不掉弹窗（2026-11-07 MNN 批次
+    // 实证 chooser-trusted-click 有但 chooser-event-node 从不出现）。
+    // 可用环境变量切回离屏模式做对照实验。
+    const hiddenWindow =
+      process.env.MULTIPUBLISH_PUBLISH_WINDOW_HIDDEN === "1";
+    const workArea = screen.getPrimaryDisplay().workAreaSize;
+    const windowWidth = Math.min(1280, workArea.width - 40);
+    const windowHeight = Math.min(900, workArea.height - 40);
+    // 并发时多个窗口错开，避免完全重叠
+    const windowIndex = this.automationWindows.size % 4;
     const automationWindow = new BrowserWindow({
       show: false,
       skipTaskbar: true,
       autoHideMenuBar: true,
       title: "MultiPublish",
-      x: -10000,
-      y: -10000,
-      width: 1280,
-      height: 900,
+      x: hiddenWindow
+        ? -10000
+        : Math.max(0, Math.round((workArea.width - windowWidth) / 2)) +
+          windowIndex * 24,
+      y: hiddenWindow
+        ? -10000
+        : Math.max(0, Math.round((workArea.height - windowHeight) / 2)) +
+          windowIndex * 24,
+      width: windowWidth,
+      height: windowHeight,
       webPreferences: {
         session: this.accountSession(account.id),
         nodeIntegration: false,
@@ -376,7 +394,13 @@ export class BrowserManager {
         backgroundThrottling: false,
       },
     });
-    automationWindow.setOpacity(0.01);
+    automationWindow.setOpacity(hiddenWindow ? 0.01 : 1);
+    await writeBrowserLog(
+      "publish-window-mode " +
+        (hiddenWindow ? "hidden" : "visible") +
+        " platform=" +
+        account.platform,
+    );
     // Keep Chromium rendering without bringing an off-screen publisher to the
     // foreground. Fully hidden windows can stall platform upload processing.
     automationWindow.showInactive();
@@ -1494,7 +1518,7 @@ export class BrowserManager {
             // 是服务端缩略图，要等平台把视频转码完才会出图（2026-11-06
             // 文心批次实证：44 秒 + 重开再等 30 秒全 miss，弹窗内帧始终
             // 00:00）。等待窗口放宽到 120 秒，给转码留足时间
-            while (!frameReady.ready && frameWaits < (coverForceFail ? 1 : 60)) {
+            while (!frameReady.ready && frameWaits < (coverForceFail ? 1 : 25)) {
               frameWaits++;
               await sleep(2000);
               frameReady = await probeFrameReady();
@@ -1636,7 +1660,7 @@ export class BrowserManager {
                   // 重开后播放器重新拉流，同样给 120 秒等转码出图
                   //（2026-11-06 文心批次实证：重开后只等 30 秒即放弃，
                   // 帧仍 00:00，点下一步原地不动导致封面硬失败）
-                  for (let wait = 0; wait < 60; wait++) {
+                  for (let wait = 0; wait < 25; wait++) {
                     frameReady = await probeFrameReady();
                     if (frameReady.ready) break;
                     await sleep(2000);
@@ -1667,7 +1691,7 @@ export class BrowserManager {
               // 点下一步弹窗会原地不动。每轮点完检查是否出现确认按钮，
               // 未前进就再点下一步，最多 10 轮（转码可能在重试期间完成，
               // 2026-11-06 文心批次实证帧就绪普遍晚于弹窗打开 2 分钟以上）
-              for (let retry = 0; retry < (coverForceFail ? 2 : 10); retry++) {
+              for (let retry = 0; retry < (coverForceFail ? 2 : 5); retry++) {
                 await sleep(3000);
                 const confirmVisible = await wc
                   .executeJavaScript(
@@ -1851,8 +1875,46 @@ export class BrowserManager {
                   .catch(() => 0);
             }
             await sleep(1000);
+            // 自动设置封面的所有路径都失败时，不再静默继续发布
+            // （用户批次实证：跳过封面根本发不出去，却报"已点击发布"
+            // 误导）。发布窗口默认可见，这里把它推到前台，明确提示
+            // 用户手动选封面，轮询等待最多 3 分钟后自动继续发布。
+            if (modalOpen) {
+              const ownerWin = BrowserWindow.fromWebContents(wc);
+              if (ownerWin && !ownerWin.isDestroyed()) {
+                const area = screen.getPrimaryDisplay().workAreaSize;
+                const w = Math.min(1280, area.width - 40);
+                const h = Math.min(900, area.height - 40);
+                ownerWin.setBounds({
+                  x: Math.max(0, Math.round((area.width - w) / 2)),
+                  y: Math.max(0, Math.round((area.height - h) / 2)),
+                  width: w,
+                  height: h,
+                });
+                ownerWin.setOpacity(1);
+                ownerWin.setAlwaysOnTop(true, "screen-saver");
+                ownerWin.showInactive();
+                ownerWin.focus();
+              }
+              await progress(
+                "publishing",
+                "头条封面自动设置失败：已打开发布窗口，请在窗口中手动选择封面（最多等待 3 分钟）",
+              );
+              await writeBrowserLog("toutiao-cover-manual-wait start");
+              const manualDeadline = Date.now() + 180000;
+              while (Date.now() < manualDeadline) {
+                await sleep(3000);
+                const manualDone = await wc
+                  .executeJavaScript(
+                    "(()=>{const t=document.body?.innerText||'';return /重新上传封面|更换封面|裁剪完成/.test(t)||!/封面截取/.test(t)})()",
+                  )
+                  .catch(() => false);
+                if (manualDone) break;
+              }
+              await writeBrowserLog("toutiao-cover-manual-wait done");
+            }
             await writeBrowserLog(
-              "toutiao-cover-continue reason=cover-not-required modalOpen=" +
+              "toutiao-cover-continue reason=cover-automation-failed modalOpen=" +
                 String(modalOpen),
             );
           }
@@ -2698,12 +2760,12 @@ export class BrowserManager {
         // 投递，靠下次发布的防重复预检才确认）。再等 90 秒让列表落库，
         // 进后台核对 90 秒，命中即判成功，避免把已成功的稿件留给人工
         await writeBrowserLog("bilibili-late-verify start");
-        await sleep(90000);
+        await sleep(30000);
         const lateVerify = await this.verifyPublishedTitle(
           wc,
           "bilibili",
           draft.title,
-          90000,
+          60000,
         ).catch(() => ({ ok: false, url: wc.getURL(), reason: "error" }));
         await writeBrowserLog(
           "bilibili-late-verify ok=" + String(lateVerify.ok),
@@ -3343,6 +3405,21 @@ export class BrowserManager {
       enabled: true,
     });
     try {
+      // 关键交互前让发布窗口成为活动窗口：用户 GUI 有主窗口在前台时，
+      // 离屏/失焦窗口上的 CDP 输入不产生用户激活，chooser 不会弹
+      // （2026-11-07 MNN 批次实证）。
+      const owner = BrowserWindow.fromWebContents(wc);
+      if (
+        process.env.MULTIPUBLISH_PUBLISH_NO_FOCUS !== "1" &&
+        owner &&
+        !owner.isDestroyed()
+      ) {
+        try {
+          owner.showInactive();
+          owner.focus();
+          await sleep(250);
+        } catch {}
+      }
       // 文件选择器必须由真实用户手势触发：clickButtonByText 的 trusted
       // 坐标分支只对"发布/发表"文本启用，程序化 element.click() 不算
       // 用户激活，浏览器不会打开 chooser、也不会派发
@@ -3401,7 +3478,7 @@ export class BrowserManager {
         : "/(video\\/|\\.(mp4|flv|avi|wmv|mov|webm|mkv|m4v|mpg|mpeg|ts|rm|rmvb|3gp|f4v))/i";
       let jsInputClicked = false;
       const start = Date.now();
-      while (Date.now() - start < 30000) {
+      while (Date.now() - start < 15000) {
         if (chooserNodeId) {
           await wc.debugger.sendCommand("DOM.setFileInputFiles", {
             backendNodeId: chooserNodeId,
@@ -3433,7 +3510,7 @@ export class BrowserManager {
           );
           return;
         }
-        if (!jsInputClicked && Date.now() - start > 6000) {
+        if (!jsInputClicked && Date.now() - start > 4000) {
           jsInputClicked = true;
           const jsClicked = await wc
             .executeJavaScript(
