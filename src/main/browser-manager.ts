@@ -1413,6 +1413,10 @@ export class BrowserManager {
           // 兜底分支，仅在显式设置环境变量时生效
           const coverForceFail =
             process.env.MULTIPUBLISH_TOUTIAO_COVER_FORCE_FAIL === "1";
+          // 精确钩子：强制封面走"本地上传 → chooser"路径（本机常规
+          // 自测常直接找到 image input 而绕开 chooser，等于没验证）
+          const coverForceChooser =
+            process.env.MULTIPUBLISH_TOUTIAO_COVER_FORCE_CHOOSER === "1";
           const coverBefore = await wc
             .executeJavaScript(
               "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';return JSON.stringify({url:location.href,body:(document.body?.innerText||'').slice(-14000),controls:[...document.querySelectorAll('button,[role=button],a,input,textarea,[contenteditable=true],div,span,label')].filter(visible).map(e=>({tag:e.tagName,text:(e.textContent||'').trim().slice(0,240),aria:e.getAttribute('aria-label'),title:e.getAttribute('title'),placeholder:e.getAttribute('placeholder'),type:e.getAttribute('type'),disabled:!!e.disabled,cls:String(e.className||'').slice(0,180)})).filter(e=>e.text||e.aria||e.title||e.placeholder).slice(-400)})})()",
@@ -1434,14 +1438,15 @@ export class BrowserManager {
           const coverModalOpened = await openCoverModal();
           if (!coverModalOpened) throw new Error("未找到头条上传封面入口");
           await sleep(1200);
-          let localCoverInput = coverForceFail
-            ? undefined
-            : await this.waitForMatchingFileInput(
-                wc,
-                "image",
-                2500,
-                [videoNodeId],
-              );
+          let localCoverInput =
+            coverForceFail || coverForceChooser
+              ? undefined
+              : await this.waitForMatchingFileInput(
+                  wc,
+                  "image",
+                  2500,
+                  [videoNodeId],
+                );
           let confirmedViaFrame = false;
           // 帧卡死逃生通道里已通过 chooser 预先设置封面图时为 true，
           // 末尾的 setFileInput/chooseFileFromButton 需要跳过
@@ -1515,12 +1520,14 @@ export class BrowserManager {
                 );
                 if (localTab) {
                   await sleep(1500);
-                  localCoverInput = await this.waitForMatchingFileInput(
-                    wc,
-                    "image",
-                    8000,
-                    [videoNodeId],
-                  );
+                  localCoverInput = coverForceChooser
+                    ? undefined
+                    : await this.waitForMatchingFileInput(
+                        wc,
+                        "image",
+                        8000,
+                        [videoNodeId],
+                      );
                   await writeBrowserLog(
                     "toutiao-cover-local-input " +
                       String(!!localCoverInput),
@@ -1539,6 +1546,16 @@ export class BrowserManager {
                       await writeBrowserLog(
                         "toutiao-cover-local-chooser true",
                       );
+                      await sleep(1500);
+                      const chooserApplied = await wc
+                        .executeJavaScript(
+                          "/裁剪完成|完成后无法继续编辑|更换封面|重新上传封面/.test(document.body?.innerText||'')",
+                        )
+                        .catch(() => false);
+                      await writeBrowserLog(
+                        "toutiao-cover-chooser-applied " +
+                          String(chooserApplied),
+                      );
                     } catch (chooserError) {
                       await writeBrowserLog(
                         "toutiao-cover-local-chooser false " +
@@ -1554,8 +1571,10 @@ export class BrowserManager {
                   }
                 }
               }
-              if (!localCoverInput && !coverForceFail) {
-                // 本地通道不可用才走原重开逻辑
+              if (!localCoverInput && !coverForceFail && !localCoverPreSet) {
+                // 本地通道不可用才走原重开逻辑；chooser 已成功设置封面
+                // 时绝不能重开弹窗，否则刚上传的封面会被冲掉
+                // （2026-11-07 chooser 修复后自测实证）
                 const closed = await this.clickButtonByText(
                   wc,
                   ["取消", "关闭"],
@@ -1756,15 +1775,48 @@ export class BrowserManager {
                 draft.coverPath,
                 videoNodeId,
               );
-            // 关掉封面弹窗，避免遮罩挡住发布按钮
+            // 关掉封面弹窗，避免遮罩挡住发布按钮（2026-11-07 Ripple
+            // 批次实证：只点"取消/关闭"后弹窗可能仍在，发布点击打在
+            // 遮罩上、无 toast、后台无新作品）。多级兜底 + 回读验证
             await this.clickButtonByText(wc, ["取消", "关闭"], false, false);
             await wc
               .executeJavaScript(
                 "(()=>{const e=[...document.querySelectorAll('[class*=close],[class*=Close],[aria-label*=关闭]')].filter(e=>e.getClientRects?.().length>0)[0];if(!e)return false;e.click();return true})()",
               )
               .catch(() => false);
-            await sleep(1200);
-            await writeBrowserLog("toutiao-cover-continue reason=cover-not-required");
+            await sleep(800);
+            const modalText = "(/封面截取|完成后无法继续编辑/.test(document.body?.innerText||''))";
+            let modalOpen = (await wc
+              .executeJavaScript(modalText)
+              .catch(() => false)) as boolean;
+            if (modalOpen) {
+              if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+              for (const type of ["keyDown", "keyUp"])
+                await wc.debugger
+                  .sendCommand("Input.dispatchKeyEvent", {
+                    type,
+                    key: "Escape",
+                    code: "Escape",
+                    windowsVirtualKeyCode: 27,
+                    nativeVirtualKeyCode: 27,
+                  })
+                  .catch(() => undefined);
+              await sleep(800);
+              modalOpen = (await wc
+                .executeJavaScript(modalText)
+                .catch(() => false)) as boolean;
+              if (modalOpen)
+                await wc
+                  .executeJavaScript(
+                    "(()=>{const d=[...document.querySelectorAll('[class*=modal],[class*=Modal],[role=dialog]')].filter(e=>e.getClientRects?.().length>0&&/封面截取|本地上传/.test(e.innerText||''));for(const e of d)e.style.display='none';return d.length})()",
+                  )
+                  .catch(() => 0);
+            }
+            await sleep(1000);
+            await writeBrowserLog(
+              "toutiao-cover-continue reason=cover-not-required modalOpen=" +
+                String(modalOpen),
+            );
           }
         } else {
           const nearbyCover =
@@ -2293,6 +2345,39 @@ export class BrowserManager {
           }
         }
         if (!submittedOk && clicked) {
+          // 2026-11-07 Ripple 批次实证：点击后按钮变"提交中..."并
+          // 11 分钟不返回，稿件最终没落库（次日预检仍 miss）。此时
+          // 反复坐标/JS 点击毫无意义，还可能造成重复投稿。先等平台
+          // 处理完（最多 3 分钟），按钮恢复"立即投稿"则重投一次
+          const submitting = async () =>
+            (await wc
+              .executeJavaScript(
+                "/提交中\\.\\.\\.|正在提交|投稿处理中/.test(document.body?.innerText||'')",
+              )
+              .catch(() => false)) as boolean;
+          if (await submitting()) {
+            await writeBrowserLog("bilibili-submit-pending start");
+            for (let i = 0; i < 18; i++) {
+              await sleep(10000);
+              if (!(await submitting())) break;
+              submittedOk = await bilibiliSubmitted();
+              if (submittedOk) break;
+            }
+            await writeBrowserLog(
+              "bilibili-submit-pending done " +
+                JSON.stringify({
+                  submittedOk,
+                  stillSubmitting: await submitting(),
+                }),
+            );
+            if (!submittedOk) {
+              await this.clickButtonByText(wc, ["立即投稿"], true, false);
+              for (let w = 0; w < 10 && !submittedOk; w++) {
+                await sleep(3000);
+                submittedOk = await bilibiliSubmitted();
+              }
+            }
+          }
           const submitDiag = await wc
             .executeJavaScript(
               "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0;return JSON.stringify({url:location.href,buttons:[...document.querySelectorAll('button,[role=button]')].filter(e=>visible(e)&&(e.textContent||'').trim().length<12).map(e=>({text:(e.textContent||'').trim(),disabled:!!e.disabled})).slice(-25),hints:[...document.querySelectorAll('div,span,p')].filter(visible).map(e=>(e.textContent||'').trim()).filter(t=>t&&t.length<100&&/投稿|封面|分区|标签|失败|错误|必填|请/.test(t)).slice(-15),body:(document.body?.innerText||'').slice(0,2000)})})()",
@@ -3211,6 +3296,11 @@ export class BrowserManager {
         chooserNodeId = params.backendNodeId;
     };
     wc.debugger.on("message", listener);
+    // Page.fileChooserOpened 属于 Page domain，必须先 enable 才会派发
+    // （B站 chooser 路径有，头条封面路径此前漏掉——2026-11-07 Ripple
+    // 批次实证 local-chooser false、从未收到 chooser 事件）
+    if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+    await wc.debugger.sendCommand("Page.enable").catch(() => undefined);
     await wc.debugger.sendCommand("Page.setInterceptFileChooserDialog", {
       enabled: true,
     });
@@ -3235,9 +3325,14 @@ export class BrowserManager {
           return;
         }
         const inputs = await this.getFileInputs(wc).catch(() => []);
+        // 图片模式：平台动态创建的封面 input 常无 accept 或用
+        // ".jpg,.png" 扩展名列表，旧逻辑只认 /image/i 会把刚出现的
+        // 控件整个漏掉（2026-11-07 Ripple 批次实证 local-input false
+        // 后 chooser 也失败）。改为排除视频 input，其余都算候选，
+        // 优先本次新出现的节点
         const candidates = inputs.filter((input) =>
           imageMode
-            ? /image/i.test(input.accept)
+            ? !/video/i.test(input.accept)
             : /video/i.test(input.accept) || !/image/i.test(input.accept),
         );
         const fresh = candidates.filter(
@@ -3252,8 +3347,10 @@ export class BrowserManager {
           jsInputClicked = true;
           const jsClicked = await wc
             .executeJavaScript(
-              "((re)=>{const all=root=>{const r=[];for(const e of root.querySelectorAll('input[type=file]'))r.push(e);for(const e of root.querySelectorAll('*'))if(e.shadowRoot)r.push(...all(e.shadowRoot));return r};const matched=all(document).filter(e=>re.test(e.accept||''));const ordered=matched.sort((a,b)=>((b.getClientRects?.().length>0)?1:0)-((a.getClientRects?.().length>0)?1:0));let n=0;for(const t of ordered){try{t.click();n++}catch(e){}}return n})(" +
+              "((re,imageMode)=>{const all=root=>{const r=[];for(const e of root.querySelectorAll('input[type=file]'))r.push(e);for(const e of root.querySelectorAll('*'))if(e.shadowRoot)r.push(...all(e.shadowRoot));return r};const matched=all(document).filter(e=>imageMode?!/video/i.test(e.accept||''):re.test(e.accept||''));const ordered=matched.sort((a,b)=>((b.getClientRects?.().length>0)?1:0)-((a.getClientRects?.().length>0)?1:0));let n=0;for(const t of ordered){try{t.click();n++}catch(e){}}return n})(" +
                 acceptRe +
+                "," +
+                JSON.stringify(imageMode) +
                 ")",
             )
             .catch(() => 0);
