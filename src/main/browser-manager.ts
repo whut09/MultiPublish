@@ -359,33 +359,19 @@ export class BrowserManager {
         status: "failed" as const,
         message: "视频文件不存在或为空：" + videoPath,
       };
-    // 发布窗口默认可见（屏幕内、不透明）：离屏 + opacity 0.01 时
-    // Chromium 会丢弃输入手势，CDP 坐标点击不算真实用户点击，导致
-    // 文件选择器不弹、Escape/取消关不掉弹窗（2026-11-07 MNN 批次
-    // 实证 chooser-trusted-click 有但 chooser-event-node 从不出现）。
-    // 可用环境变量切回离屏模式做对照实验。
-    const hiddenWindow =
-      process.env.MULTIPUBLISH_PUBLISH_WINDOW_HIDDEN === "1";
-    const workArea = screen.getPrimaryDisplay().workAreaSize;
-    const windowWidth = Math.min(1280, workArea.width - 40);
-    const windowHeight = Math.min(900, workArea.height - 40);
-    // 并发时多个窗口错开，避免完全重叠
-    const windowIndex = this.automationWindows.size % 4;
+    // 发布窗口必须离屏 + 透明：2026-11-07 一度改成屏幕内可见，
+    // 用户反馈"弹一堆窗口"（多平台并发时每个任务各开一个窗口）。
+    // 恢复默认静默离屏；只有在显式设置
+    // MULTIPUBLISH_PUBLISH_WINDOW_VISIBLE=1 做诊断时才显示。
     const automationWindow = new BrowserWindow({
       show: false,
       skipTaskbar: true,
       autoHideMenuBar: true,
       title: "MultiPublish",
-      x: hiddenWindow
-        ? -10000
-        : Math.max(0, Math.round((workArea.width - windowWidth) / 2)) +
-          windowIndex * 24,
-      y: hiddenWindow
-        ? -10000
-        : Math.max(0, Math.round((workArea.height - windowHeight) / 2)) +
-          windowIndex * 24,
-      width: windowWidth,
-      height: windowHeight,
+      x: -10000,
+      y: -10000,
+      width: 1280,
+      height: 900,
       webPreferences: {
         session: this.accountSession(account.id),
         nodeIntegration: false,
@@ -394,13 +380,19 @@ export class BrowserManager {
         backgroundThrottling: false,
       },
     });
-    automationWindow.setOpacity(hiddenWindow ? 0.01 : 1);
-    await writeBrowserLog(
-      "publish-window-mode " +
-        (hiddenWindow ? "hidden" : "visible") +
-        " platform=" +
-        account.platform,
-    );
+    automationWindow.setOpacity(0.01);
+    if (process.env.MULTIPUBLISH_PUBLISH_WINDOW_VISIBLE === "1") {
+      const area = screen.getPrimaryDisplay().workAreaSize;
+      const w = Math.min(1280, area.width - 40);
+      const h = Math.min(900, area.height - 40);
+      automationWindow.setBounds({
+        x: Math.max(0, Math.round((area.width - w) / 2)),
+        y: Math.max(0, Math.round((area.height - h) / 2)),
+        width: w,
+        height: h,
+      });
+      automationWindow.setOpacity(1);
+    }
     // Keep Chromium rendering without bringing an off-screen publisher to the
     // foreground. Fully hidden windows can stall platform upload processing.
     automationWindow.showInactive();
@@ -1875,47 +1867,16 @@ export class BrowserManager {
                   .catch(() => 0);
             }
             await sleep(1000);
-            // 自动设置封面的所有路径都失败时，不再静默继续发布
-            // （用户批次实证：跳过封面根本发不出去，却报"已点击发布"
-            // 误导）。发布窗口默认可见，这里把它推到前台，明确提示
-            // 用户手动选封面，轮询等待最多 3 分钟后自动继续发布。
-            if (modalOpen) {
-              const ownerWin = BrowserWindow.fromWebContents(wc);
-              if (ownerWin && !ownerWin.isDestroyed()) {
-                const area = screen.getPrimaryDisplay().workAreaSize;
-                const w = Math.min(1280, area.width - 40);
-                const h = Math.min(900, area.height - 40);
-                ownerWin.setBounds({
-                  x: Math.max(0, Math.round((area.width - w) / 2)),
-                  y: Math.max(0, Math.round((area.height - h) / 2)),
-                  width: w,
-                  height: h,
-                });
-                ownerWin.setOpacity(1);
-                ownerWin.setAlwaysOnTop(true, "screen-saver");
-                ownerWin.showInactive();
-                ownerWin.focus();
-              }
-              await progress(
-                "publishing",
-                "头条封面自动设置失败：已打开发布窗口，请在窗口中手动选择封面（最多等待 3 分钟）",
-              );
-              await writeBrowserLog("toutiao-cover-manual-wait start");
-              const manualDeadline = Date.now() + 180000;
-              while (Date.now() < manualDeadline) {
-                await sleep(3000);
-                const manualDone = await wc
-                  .executeJavaScript(
-                    "(()=>{const t=document.body?.innerText||'';return /重新上传封面|更换封面|裁剪完成/.test(t)||!/封面截取/.test(t)})()",
-                  )
-                  .catch(() => false);
-                if (manualDone) break;
-              }
-              await writeBrowserLog("toutiao-cover-manual-wait done");
-            }
+            // 自动设置封面的所有路径都失败：不再静默"继续发布"假装成功
+            // （用户批次实证跳过封面根本发不出去），也不弹窗口打扰用户
+            // （2026-11-07 用户明确反馈"怎么弹一堆窗口，不要瞎改"）。
+            // 直接给出明确失败原因，任务快速结束，不空等 3 分钟。
             await writeBrowserLog(
-              "toutiao-cover-continue reason=cover-automation-failed modalOpen=" +
+              "toutiao-cover-automation-failed modalOpen=" +
                 String(modalOpen),
+            );
+            throw new Error(
+              "头条封面自动设置失败（弹窗无可用图片控件且无法关闭）。请点重新发布重试，或用『打开发布页』手动设置封面",
             );
           }
         } else {
@@ -3405,21 +3366,6 @@ export class BrowserManager {
       enabled: true,
     });
     try {
-      // 关键交互前让发布窗口成为活动窗口：用户 GUI 有主窗口在前台时，
-      // 离屏/失焦窗口上的 CDP 输入不产生用户激活，chooser 不会弹
-      // （2026-11-07 MNN 批次实证）。
-      const owner = BrowserWindow.fromWebContents(wc);
-      if (
-        process.env.MULTIPUBLISH_PUBLISH_NO_FOCUS !== "1" &&
-        owner &&
-        !owner.isDestroyed()
-      ) {
-        try {
-          owner.showInactive();
-          owner.focus();
-          await sleep(250);
-        } catch {}
-      }
       // 文件选择器必须由真实用户手势触发：clickButtonByText 的 trusted
       // 坐标分支只对"发布/发表"文本启用，程序化 element.click() 不算
       // 用户激活，浏览器不会打开 chooser、也不会派发
@@ -5873,28 +5819,14 @@ export class BrowserManager {
             )
             .catch(() => false);
         }
-        const owner = BrowserWindow.fromWebContents(wc);
-        if (owner && !owner.isDestroyed()) {
-          // 窗口创建在 (-10000,-10000) 离屏，只改透明度/show/focus
-          // 用户仍看不见验证码弹窗（2026-11-07 Ling 批次实证：
-          // B站风控任务超时，用户无从输入）。必须移回屏幕内
-          const area = screen.getPrimaryDisplay().workAreaSize;
-          const w = Math.min(1280, area.width - 40);
-          const h = Math.min(900, area.height - 40);
-          owner.setBounds({
-            x: Math.max(0, Math.round((area.width - w) / 2)),
-            y: Math.max(0, Math.round((area.height - h) / 2)),
-            width: w,
-            height: h,
-          });
-          owner.setOpacity(1);
-          owner.setAlwaysOnTop(true, "screen-saver");
-          owner.show();
-          owner.focus();
-          await writeBrowserLog(
-            "challenge-window-revealed platform=" + platform,
-          );
-        }
+        // 风控属于人工环节，但用户明确要求"不要弹一堆窗口"：
+        // 这里只留日志，不再 show/focus 发布窗口打扰桌面。
+        await writeBrowserLog(
+          "challenge-detected platform=" +
+            platform +
+            " text=" +
+            (lastChallenge || "").slice(0, 120),
+        );
         await sleep(2000);
         continue;
       }
