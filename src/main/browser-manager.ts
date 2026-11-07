@@ -1,4 +1,4 @@
-import { app, BrowserWindow, WebContentsView, session, shell } from "electron";
+import { app, BrowserWindow, WebContentsView, screen, session, shell } from "electron";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type {
@@ -1532,11 +1532,36 @@ export class BrowserManager {
                     "toutiao-cover-local-input " +
                       String(!!localCoverInput),
                   );
+                  if (!localCoverInput && !coverForceChooser) {
+                    // 放宽一轮：平台动态创建的图片 input accept 可能为空
+                    // 或 ".jpg,.png"，waitForMatchingFileInput("image")
+                    // 认不出；多给 15 秒枚举所有非视频 file input
+                    // （2026-11-07 Ling 批次 local-input false 实证）
+                    const deadline = Date.now() + 15000;
+                    while (Date.now() < deadline && !localCoverInput) {
+                      const all = await this.getFileInputs(wc).catch(() => []);
+                      const hit = all.find(
+                        (i) =>
+                          i.nodeId !== videoNodeId && !/video/i.test(i.accept),
+                      );
+                      if (hit) localCoverInput = hit;
+                      else await sleep(700);
+                    }
+                    await writeBrowserLog(
+                      "toutiao-cover-wide-input " +
+                        String(!!localCoverInput),
+                    );
+                  }
                   if (!localCoverInput) {
                     // 页签里没有裸露的 image input（2026-11-04 Strata 批次
                     // 实证 local-input false）：点页签内的上传按钮，走
                     // chooser 拦截直接设置封面图
                     try {
+                      if (
+                        process.env.MULTIPUBLISH_TOUTIAO_COVER_FORCE_DROP ===
+                        "1"
+                      )
+                        throw new Error("自测：强制 chooser 失败以验证 drop 注入");
                       await this.chooseFileFromButton(
                         wc,
                         ["点击上传", "上传图片", "上传封面", "选择图片", "本地上传"],
@@ -1561,12 +1586,25 @@ export class BrowserManager {
                         "toutiao-cover-local-chooser false " +
                           String(chooserError).slice(0, 300),
                       );
-                      localCoverInput = await this.waitForMatchingFileInput(
+                      // chooser 也不弹时改用 DataTransfer/drop 注入，
+                      // 完全不依赖 input 与用户手势
+                      const dropped = await this.dropToutiaoCover(
                         wc,
-                        "image",
-                        4000,
-                        [videoNodeId],
+                        draft.coverPath,
                       );
+                      if (dropped) {
+                        localCoverPreSet = true;
+                        await writeBrowserLog(
+                          "toutiao-cover-drop-pre-set true",
+                        );
+                      } else {
+                        localCoverInput = await this.waitForMatchingFileInput(
+                          wc,
+                          "image",
+                          4000,
+                          [videoNodeId],
+                        );
+                      }
                     }
                   }
                 }
@@ -3305,7 +3343,54 @@ export class BrowserManager {
       enabled: true,
     });
     try {
-      const clicked = await this.clickButtonByText(wc, labels, true, true);
+      // 文件选择器必须由真实用户手势触发：clickButtonByText 的 trusted
+      // 坐标分支只对"发布/发表"文本启用，程序化 element.click() 不算
+      // 用户激活，浏览器不会打开 chooser、也不会派发
+      // Page.fileChooserOpened（2026-11-07 Ling 批次实证
+      // chooser-js-input-click 0 / local-chooser false）。这里用 CDP
+      // Input.dispatchMouseEvent 做可信点击。
+      const point = (await wc
+        .executeJavaScript(
+          "((labels)=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};for(const label of labels){const c=all(document).filter(e=>visible(e)&&(e.textContent||'').trim()===label&&e.children.length<5);c.sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return ar.width*ar.height-br.width*br.height});const t=c[0];if(!t)continue;t.scrollIntoView({block:'center'});const r=t.getBoundingClientRect();return{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),label}}return null})(" +
+            JSON.stringify(labels) +
+            ")",
+        )
+        .catch(() => null)) as {
+        x: number;
+        y: number;
+        label: string;
+      } | null;
+      let clicked = false;
+      if (point && Number.isFinite(point.x) && Number.isFinite(point.y)) {
+        await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+          type: "mouseMoved",
+          x: point.x,
+          y: point.y,
+        });
+        await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+          type: "mousePressed",
+          x: point.x,
+          y: point.y,
+          button: "left",
+          buttons: 1,
+          clickCount: 1,
+        });
+        await sleep(120);
+        await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+          type: "mouseReleased",
+          x: point.x,
+          y: point.y,
+          button: "left",
+          buttons: 0,
+          clickCount: 1,
+        });
+        clicked = true;
+        await writeBrowserLog(
+          "chooser-trusted-click " + JSON.stringify(point),
+        );
+      } else {
+        clicked = await this.clickButtonByText(wc, labels, true, true);
+      }
       if (!clicked) throw new Error(labels.join("/") + "上传按钮不存在");
       // 兜底预备：真实 CDP 点击可能被浮层遮挡/坐标偏移而未唤起 chooser
       // （2026-11-05 头条封面本地上传页签实证：按钮点了但 30s 无 chooser、
@@ -3322,6 +3407,7 @@ export class BrowserManager {
             backendNodeId: chooserNodeId,
             files: [file],
           });
+          await writeBrowserLog("chooser-event-node " + String(chooserNodeId));
           return;
         }
         const inputs = await this.getFileInputs(wc).catch(() => []);
@@ -3341,6 +3427,10 @@ export class BrowserManager {
         const target = fresh.at(-1) || candidates.at(-1);
         if (target && Date.now() - start > 800) {
           await this.setFileInput(wc, target.nodeId, [file]);
+          await writeBrowserLog(
+            "chooser-input-node " +
+              JSON.stringify({ nodeId: target.nodeId, accept: target.accept }),
+          );
           return;
         }
         if (!jsInputClicked && Date.now() - start > 6000) {
@@ -4704,6 +4794,54 @@ export class BrowserManager {
     }
     return false;
   }
+  // 头条"本地上传"页签可能既没有常驻图片 input、chooser 也不弹
+  // （2026-11-07 Ling 批次实证 local-input false + local-chooser false）。
+  // 直接构造 File/DataTransfer 派发 dragover/drop，并给任意非视频
+  // file input 赋值 + change：不依赖 chooser、不依赖真实用户手势。
+  private async dropToutiaoCover(
+    wc: Electron.WebContents,
+    coverPath: string,
+  ) {
+    try {
+      const buf = await fs.readFile(coverPath);
+      const mime = /\.png$/i.test(coverPath)
+        ? "image/png"
+        : /\.webp$/i.test(coverPath)
+          ? "image/webp"
+          : "image/jpeg";
+      const name = path.basename(coverPath);
+      const result = (await wc
+        .executeJavaScript(
+          "((b64,mime,name)=>{const bin=atob(b64);const arr=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i);const file=new File([arr],name,{type:mime});const dt=new DataTransfer();dt.items.add(file);const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const visible=e=>!!e&&e.getClientRects?.().length>0;const nodes=all(document).filter(e=>{if(!visible(e))return false;const t=(e.textContent||'').trim();const c=String(e.className||'');const r=e.getBoundingClientRect();return r.width>60&&r.height>40&&(/点击上传|拖拽|上传图片|本地上传|封面/.test(t)||/upload|drop|drag/i.test(c))}).sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return ar.width*ar.height-br.width*br.height}).slice(0,8);let drops=0;for(const el of nodes){try{el.dispatchEvent(new DragEvent('dragenter',{dataTransfer:dt,bubbles:true,cancelable:true}));el.dispatchEvent(new DragEvent('dragover',{dataTransfer:dt,bubbles:true,cancelable:true}));el.dispatchEvent(new DragEvent('drop',{dataTransfer:dt,bubbles:true,cancelable:true}));drops++}catch(e){}}let inputs=0;for(const i of all(document).filter(e=>e.tagName==='INPUT'&&e.type==='file'&&!/video/i.test(e.accept||''))){try{i.files=dt.files;i.dispatchEvent(new Event('change',{bubbles:true}));i.dispatchEvent(new Event('input',{bubbles:true}));inputs++}catch(e){}}return{drops,inputs}})(" +
+            JSON.stringify(buf.toString("base64")) +
+            "," +
+            JSON.stringify(mime) +
+            "," +
+            JSON.stringify(name) +
+            ")",
+        )
+        .catch(() => ({ drops: 0, inputs: 0 }))) as {
+        drops: number;
+        inputs: number;
+      };
+      await sleep(2500);
+      const applied = await wc
+        .executeJavaScript(
+          "/裁剪完成|完成后无法继续编辑|更换封面|重新上传封面/.test(document.body?.innerText||'')",
+        )
+        .catch(() => false);
+      await writeBrowserLog(
+        "toutiao-cover-drop " +
+          JSON.stringify({ ...result, applied, bytes: buf.length }),
+      );
+      return !!applied;
+    } catch (error) {
+      await writeBrowserLog(
+        "toutiao-cover-drop-error " + String(error).slice(0, 300),
+      );
+      return false;
+    }
+  }
   private async setFileInput(
     wc: Electron.WebContents,
     nodeId: number,
@@ -5660,10 +5798,25 @@ export class BrowserManager {
         }
         const owner = BrowserWindow.fromWebContents(wc);
         if (owner && !owner.isDestroyed()) {
+          // 窗口创建在 (-10000,-10000) 离屏，只改透明度/show/focus
+          // 用户仍看不见验证码弹窗（2026-11-07 Ling 批次实证：
+          // B站风控任务超时，用户无从输入）。必须移回屏幕内
+          const area = screen.getPrimaryDisplay().workAreaSize;
+          const w = Math.min(1280, area.width - 40);
+          const h = Math.min(900, area.height - 40);
+          owner.setBounds({
+            x: Math.max(0, Math.round((area.width - w) / 2)),
+            y: Math.max(0, Math.round((area.height - h) / 2)),
+            width: w,
+            height: h,
+          });
           owner.setOpacity(1);
           owner.setAlwaysOnTop(true, "screen-saver");
           owner.show();
           owner.focus();
+          await writeBrowserLog(
+            "challenge-window-revealed platform=" + platform,
+          );
         }
         await sleep(2000);
         continue;

@@ -229,6 +229,69 @@ async function runPublishSelfTest() {
   }
   return true;
 }
+// 并发回归自测：同时开多个离屏发布窗口（与 publish:auto 的 3 worker
+// 等价），用于复现/验证"单平台自测全绿、多平台并发失败"的环境差异。
+async function runMultiPublishSelfTest() {
+  const list = process.env.MULTIPUBLISH_PUBLISH_SELF_TEST_MULTI;
+  if (!list) return false;
+  const reportPath =
+    process.env.MULTIPUBLISH_PUBLISH_SELF_TEST_RESULT ||
+    path.join(app.getPath("temp"), "multipublish-multi-self-test.json");
+  const draftId = process.env.MULTIPUBLISH_PUBLISH_SELF_TEST_DRAFT_ID;
+  const platforms = list.split(",").map((item) => item.trim()).filter(Boolean);
+  const data = store.get();
+  const draft = draftId
+    ? data.drafts.find((item) => item.id === draftId)
+    : undefined;
+  const results = await Promise.all(
+    platforms.map(async (platform) => {
+      const account = data.accounts.find((item) => item.platform === platform);
+      let testWindow: BrowserWindow | undefined;
+      let manager: BrowserManager | undefined;
+      try {
+        if (!account) throw new Error("找不到平台账号：" + platform);
+        if (!draft) throw new Error("找不到草稿");
+        testWindow = new BrowserWindow({
+          show: false,
+          width: 320,
+          height: 240,
+          webPreferences: {
+            contextIsolation: true,
+            nodeIntegration: false,
+            sandbox: true,
+          },
+        });
+        manager = new BrowserManager(testWindow, async () => undefined);
+        const result = await manager.autoPublish(
+          account,
+          draft,
+          async (status, message) =>
+            console.log("multi-self-test", platform, status, message),
+        );
+        return { platform, ...result };
+      } catch (error) {
+        return {
+          platform,
+          status: "failed",
+          message: String(error),
+        };
+      } finally {
+        manager?.destroy();
+        if (testWindow && !testWindow.isDestroyed()) testWindow.destroy();
+      }
+    }),
+  );
+  const report = {
+    ok: results.every((item) => item.status === "success"),
+    platforms,
+    draftId,
+    results,
+    createdAt: new Date().toISOString(),
+  };
+  await fs.writeFile(reportPath, JSON.stringify(report, null, 2), "utf8");
+  app.exit(report.ok ? 0 : 2);
+  return true;
+}
 async function runInspectSelfTest() {
   const platform = process.env.MULTIPUBLISH_INSPECT_SELF_TEST_PLATFORM;
   if (!platform) return false;
@@ -726,7 +789,17 @@ function ipc() {
     const tasks = store
       .get()
       .tasks.filter((x) => x.draftId === draftId && x.status !== "success");
-    const concurrency = Math.min(3, tasks.length);
+    // 2026-11-07：平台自动化所有通过的自测都是"单离屏窗口"，而用户
+    // 3 并发时 chooser 文件对话框、B站风控验证码窗口等需要真实窗口
+    // 交互的环节反复失效（多个失焦透明窗口竞争）。默认串行，一次只
+    // 开一个发布窗口；需要提速时可用环境变量调回并发度。
+    const requested = Number(
+      process.env.MULTIPUBLISH_PUBLISH_CONCURRENCY || "1",
+    );
+    const concurrency = Math.max(
+      1,
+      Math.min(Number.isFinite(requested) ? requested : 1, tasks.length),
+    );
     let cursor = 0;
     const worker = async () => {
       while (true) {
@@ -801,6 +874,7 @@ app.whenReady().then(async () => {
   const recovery = await store.load();
   if (recovery.warning) console.warn(recovery.warning);
   if (await runPublishSelfTest()) return;
+  if (await runMultiPublishSelfTest()) return;
   if (await runInspectSelfTest()) return;
   if (await runBilibiliDeclarationProbe()) return;
   if (await runViewRaceSelfTest()) return;
