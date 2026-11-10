@@ -839,7 +839,9 @@ export class BrowserManager {
             if (!login.loggedIn) {
               return {
                 status: "manual_required" as const,
-                message: "Login required",
+                message:
+                  platformMap[account.platform].name +
+                  "账号登录已失效（当前停在登录页），请在应用内打开该平台重新登录后，再点重新发布",
               };
             }
             // 上传控件始终未出现：落盘页面快照供取证
@@ -4705,6 +4707,21 @@ export class BrowserManager {
         const inputs = await this.getFileInputs(wc);
         if (inputs.length) return inputs;
       } catch {}
+      // 被重定向到登录页时立即退出，不再空等整个超时窗口
+      // （2026-11-10 头条实证：登录页找控件白等 3 分钟）
+      const currentUrl = wc.getURL();
+      try {
+        if (
+          /^\/(login|passport|signin|auth)(\/|$)/i.test(
+            new URL(currentUrl).pathname,
+          )
+        ) {
+          await writeBrowserLog(
+            "file-input-login-redirect " + currentUrl.slice(0, 220),
+          );
+          return [];
+        }
+      } catch {}
       await sleep(1500);
     }
     const frames = await Promise.all(
@@ -5933,6 +5950,19 @@ export class BrowserManager {
           !result.visibleLogin &&
           !result.loginText &&
           /内容管理|发布|数据/.test(result.text);
+      // 平台把未登录用户重定向到 /login 等页面时，DOM 文案判定可能漏判
+      // （2026-11-10 头条实证：mp.toutiao.com/login/?redirect_url=...
+      // 被 getLoginState 判为已登录，随后在登录页傻等 3 分钟找上传控件，
+      // 最后报"未找到视频上传控件"误导）。URL 路径是最可靠的判据。
+      const currentPath = (() => {
+        try {
+          return new URL(url).pathname;
+        } catch {
+          return "";
+        }
+      })();
+      if (/^\/(login|passport|signin|auth)(\/|$)/i.test(currentPath))
+        loggedIn = false;
       return {
         loggedIn,
         pending:
