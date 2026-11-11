@@ -113,6 +113,12 @@ export class BrowserManager {
   private weixinPostCreateRequested = new Set<number>();
   private weixinPostListTitles = new Map<number, string[]>();
   private xhsOrigins = new Map<string, string>();
+  // 抖音发布 POST 是否已发出（按 webContents id 记录）。
+  // 用途：clicked 后若已看到发布请求发出，说明平台已受理本次提交，
+  // 此时**绝不能再点一次发布**（否则同一条作品会发两遍）。反过来，
+  // 若 20 秒内既没有提交证据也没有发布请求，说明平台静默忽略了这次
+  // 点击（视频解析未完成），此时才允许用 CDP 真实鼠标事件补点一次。
+  private douyinPublishPosted = new Set<number>();
   // 小红书可见视图的发布请求探针（按账号记录，避免重复挂载）
   private xhsViewProbes = new Map<
     string,
@@ -2252,20 +2258,91 @@ export class BrowserManager {
         // 实证：clicked=true 但发布 POST 从未发出）。未跳转时抓现场并用
         // CDP 真实鼠标事件重试一次。
         if (clicked) {
+          // 判定"发布是否真的被平台接收"。
+          //
+          // 2026-11-10 全日志 44 批实证（原实现两处假阳性）：
+          //  1) `if (!/\/content\/post\/video/.test(wc.getURL())) return true;`
+          //     —— URL 离开投稿页不等于作品入库。失败批 11-10 11:42 点击后
+          //     同样跳到内容管理页，但作品数 430→430 从未增长。
+          //  2) `/发布成功|上传成功|作品已发布/` —— "上传成功"是**文件上传
+          //     完成**文案（视频传完后常驻页面），"作品已发布"从不出现在
+          //     投稿页。两者都不是发布成功证据。
+          // 后果：published() 在 43/44 批立即返回 true，stuck 检测与 CDP
+          // 真实鼠标点击兜底（douyin-publish-retry-mouse）几乎从未执行。
+          // 全日志唯一触发兜底的 11-10 11:25 批（stuck 现场：文件解析中
+          // 0%，封面弹窗未关）经 retry-mouse x=326,y=765 后成功落库 ——
+          // 说明 CDP 真实鼠标点击是实证有效的落库路径。
+          //
+          // 现在只认两类正向证据：
+          //  A) 页面出现真正的发布成功提示（排除"上传成功"这种文件文案）
+          //  B) 跳转后内容管理页出现目标标题（由后台列表证实作品入库）
           const published = async () => {
-            if (!/\/content\/post\/video/.test(wc.getURL())) return true;
-            return await wc
+            const text = await wc
               .executeJavaScript(
-                "/发布成功|上传成功|作品已发布/.test(document.body?.innerText||'')",
+                "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0;const t=[...document.querySelectorAll('div,span,p,strong,h1,h2,h3')].filter(visible).map(e=>(e.textContent||'').trim()).filter(x=>x&&x.length<60).slice(0,400).join('\\n');return{body:(document.body?.innerText||'').slice(0,3000),tips:t}})()",
               )
-              .catch(() => false);
+              .catch(() => ({ body: "", tips: "" }));
+            // A) 真正的发布成功提示。必须排除"上传成功"（文件上传完成）
+            //    与"上传完成"，它们在上传结束后的投稿页上长期存在。
+            const successTip = /发布成功|作品已发布|发布完成|提交成功|已发布作品/.test(
+              text.body,
+            );
+            if (successTip) return true;
+            // B) 已经跳到内容管理页：只有在后台列表里看到目标标题才算落库。
+            //    标题由外层注入（draft.title 前 30 字）。
+            if (/\/content\/manage/.test(wc.getURL())) {
+              const expected = Array.from(draft.title).slice(0, 30).join("");
+              const found = await wc
+                .executeJavaScript(
+                  "(()=>{const t=document.body?.innerText||'';const v=t.replace(/[^\\p{L}\\p{N}]+/gu,'');return v})()",
+                )
+                .catch(() => "");
+              if (
+                found.includes(
+                  expected.replace(/[^\p{L}\p{N}]+/gu, "").toLowerCase(),
+                )
+              )
+                return true;
+            }
+            return false;
           };
-          let submitted = false;
-          for (let wait = 0; wait < 8 && !submitted; wait++) {
-            await sleep(2500);
-            submitted = await published();
-          }
-          if (!submitted) {
+          // 轮询提交证据。必须区分两种"未提交"，处置方式完全不同：
+          //  1) 页面**仍在投稿页** → 平台静默忽略了这次点击（视频解析未完
+          //     被忽略）。此时页面上"发布"按钮还在，可以用 CDP 真实鼠标
+          //     点击重试 —— 11-10 11:25 批实证该路径有效（retry-mouse
+          //     x=326,y=765 后成功落库）。
+          //  2) 页面**已跳内容管理页**但目标标题还没出现 → 平台已经接收
+          //     请求，作品在服务端转码后才会入列表（实证：作品卡片状态
+          //     先是"审核中"）。此时页面已无"发布"按钮，CDP 兜底形同
+          //     虚设，只能等入库。
+          const onManagePage = () => /\/content\/manage/.test(wc.getURL());
+          const waitForSubmit = async () => {
+            // 阶段一：20s 快速判定（仍在投稿页时这 20s 足够暴露静默忽略）
+            for (let wait = 0; wait < 8; wait++) {
+              await sleep(2500);
+              if (await published()) return true;
+            }
+            // 阶段二：已跳管理页 → 平台已接收，等作品入库（抖音转码耗时
+            // 可达数分钟）。这里给 160s。
+            if (onManagePage()) {
+              for (let wait = 0; wait < 64; wait++) {
+                await sleep(2500);
+                if (await published()) return true;
+              }
+              await writeBrowserLog(
+                "douyin-submit-accepted-not-listed url=" +
+                  wc.getURL(),
+              );
+            }
+            return false;
+          };
+          let submitted = await waitForSubmit();
+          // 防重复发布护栏：若探针已看到"发布类 POST"发出，说明平台已经
+          // 受理了本次提交 —— 此时再补一次点击会把同一条作品发两遍。
+          // 只有"平台完全没受理"（无发布 POST + 页面仍在投稿页）才允许
+          // 用 CDP 真实鼠标事件补点一次。
+          const platformAccepted = this.douyinPublishPosted.has(wc.id);
+          if (!submitted && !onManagePage() && !platformAccepted) {
             const stuckDiag = await wc
               .executeJavaScript(
                 "(()=>{const visible=e=>!!e&&e.getClientRects?.().length>0;return JSON.stringify({url:location.href,videos:[...document.querySelectorAll('video')].map(v=>({rs:v.readyState,dur:Number.isFinite(v.duration)?Math.round(v.duration):-1})),buttons:[...document.querySelectorAll('button')].filter(e=>visible(e)&&(e.textContent||'').trim().length<10).map(e=>({text:(e.textContent||'').trim(),disabled:!!e.disabled})).slice(-20),hints:[...document.querySelectorAll('div,span,p')].filter(visible).map(e=>(e.textContent||'').trim()).filter(t=>t&&t.length<120&&/上传|发布|请|必填|失败|错误|稍候|稍后|审核/.test(t)).slice(-15),body:(document.body?.innerText||'').slice(0,2500)})})()",
@@ -2307,15 +2384,23 @@ export class BrowserManager {
               await writeBrowserLog(
                 "douyin-publish-retry-mouse " + JSON.stringify(rect),
               );
-              for (let wait = 0; wait < 8 && !submitted; wait++) {
-                await sleep(2500);
-                submitted = await published();
-              }
+              submitted = await waitForSubmit();
             }
             if (!submitted)
               await writeBrowserLog(
                 "douyin-publish-no-submit url=" + wc.getURL(),
               );
+          } else if (!submitted) {
+            // 已跳管理页但列表里没有目标标题，或平台已受理（发布 POST
+            // 已发出）但页面仍在投稿页：平台可能已接收但还在转码，
+            // 也可能整批被丢弃。交给后面的 verifyPublishedTitle 裁决，
+            // 这里只留痕，不做任何点击。
+            await writeBrowserLog(
+              "douyin-publish-not-listed url=" +
+                wc.getURL() +
+                " accepted=" +
+                String(platformAccepted),
+            );
           }
         }
         await sleep(4000);
@@ -2783,6 +2868,7 @@ export class BrowserManager {
           .sendCommand("Network.disable")
           .catch(() => undefined);
       }
+      this.douyinPublishPosted.delete(wc.id);
       if (xhsNetworkListener)
         wc.debugger.removeListener("message", xhsNetworkListener);
       this.automationWindows.delete(account.id);
@@ -4253,6 +4339,11 @@ export class BrowserManager {
         platform === "douyin"
           ? /(aweme\/v1\/(video|post)\/publish|publish\/video|aweme\/v1\/create)/i
           : /(publish|note|create|upload)/i;
+      // 抖音发布请求探针（2026-11-10 补）：原 publishUrl 正则漏掉了真实
+      // 发布接口，导致"点了发布但请求没发出"无法取证。改为记录
+      // creator.douyin.com / aweme 域下的**所有 POST**（只记 path +
+      // method + body 长度，不记 body，避免日志爆炸），这样下次失败能
+      // 直接看到：发布请求到底发没发、发了哪个接口。
       const listener = (_event: Electron.Event, method: string, params: any) => {
         if (method === "Network.requestWillBeSent") {
           const request = (
@@ -4261,7 +4352,48 @@ export class BrowserManager {
             }
           ).request;
           if (!request?.url || request.method !== "POST") return;
-          if (!publishUrl.test(request.url)) return;
+          const isDouyinPost =
+            platform === "douyin" &&
+            /^https:\/\/[^/]*douyin\.com\//.test(request.url);
+          if (!publishUrl.test(request.url)) {
+            if (!isDouyinPost) return;
+            // 抖音：非"已知发布接口"的 POST 也留一条 path 摘要
+            const postPath = request.url.split("?")[0].slice(0, 200);
+            const bodyLength = (request.postData || "").length;
+            // 发布受理证据：抖音真实发布接口路径已由 2026-11-11 实测
+            // 自测确认 —— 点击"发布"后 245ms 发出
+            //   POST https://creator.douyin.com/web/api/media/aweme/create_v2/
+            // （旧探针的正则漏掉了它，导致"点了发布但请求没发出"无法取证）。
+            // 判据必须**精确**：不能只看 bodyLength —— 视频分片上传
+            // （tos-d-x-lf.../upload/v1/...，bodyLength 24KB~266KB）与封面
+            // 生成（/aweme/v1/cover/gen/post/）都会超过阈值，若误判成
+            // "已受理"，护栏就会阻止必要的重试点击。
+            // 命中发布接口 → 平台已受理本次提交，此时**绝不能再点一次**
+            // （否则同一条作品发两遍）。
+            const isPublishApi =
+              /^https:\/\/creator\.douyin\.com\/web\/api\/media\/aweme\/create/.test(
+                postPath,
+              ) ||
+              /^https:\/\/creator\.douyin\.com\/aweme\/v1\/web\/aweme\/post/.test(
+                postPath,
+              );
+            if (isPublishApi) {
+              this.douyinPublishPosted.add(wc.id);
+              void writeBrowserLog(
+                "douyin-publish-request " +
+                  JSON.stringify({ path: postPath, bodyLength }),
+              );
+            }
+            void writeBrowserLog(
+              "douyin-post-request " +
+                JSON.stringify({
+                  path: postPath,
+                  bodyLength,
+                  publishLike: isPublishApi,
+                }),
+            );
+            return;
+          }
           const body = request.postData || "";
           const urlShort = request.url.slice(0, 200);
           // 从请求体里找原创/声明相关字段（不同平台字段名不同）
@@ -4287,7 +4419,19 @@ export class BrowserManager {
           params as { response?: { url?: string; status?: number } }
         ).response;
         if (!response?.url) return;
+        // 抖音：2026-11-10 全日志实证，原探针两处正则都漏掉真实发布
+        // 接口 —— 请求侧只认 aweme/v1/(video|post)/publish，响应侧只认
+        // publish|aweme/v1/(video|post)|creator/content，实际抖音的发布
+        // 接口路径不在其中，导致"点击发布后到底有没有发请求"无法取证。
+        // 这里放宽为：creator.douyin.com 上的所有接口响应都留痕（只记
+        // path + status，不记 body，量可控）。
+        const isDouyinApi =
+          platform === "douyin" &&
+          /^https:\/\/[^/]*douyin\.com\/aweme\/|^https:\/\/creator\.douyin\.com\//.test(
+            response.url,
+          );
         if (
+          !isDouyinApi &&
           !/(publish|aweme\/v1\/(video|post)|creator\/content)/i.test(
             response.url,
           )
@@ -5271,6 +5415,8 @@ export class BrowserManager {
   ) {
     const start = Date.now();
     let lastDiagnosticAt = 0;
+    // 抖音"仍在解析"状态的起始时刻：用于 180 秒宽限（文案残留时不卡死）
+    let douyinBusySince = 0;
     while (Date.now() - start < timeout) {
       if (wc.isDestroyed()) throw new Error("发布窗口已关闭");
       const uploadFailure = this.weixinUploadFailures.get(wc.id);
@@ -5424,7 +5570,7 @@ export class BrowserManager {
         continue;
       }
       const state = await wc.executeJavaScript(
-        "(()=>{const visible=e=>!!e&&e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';const roots=[document],nodes=[];for(let i=0;i<roots.length;i++){for(const e of roots[i].querySelectorAll('*')){nodes.push(e);if(e.shadowRoot)roots.push(e.shadowRoot)}}const text=roots.map(root=>root===document?(document.body?.innerText||''):(root.textContent||'')).join(' ');const buttons=nodes.filter(e=>e.matches?.('button,[role=button],div,span')&&visible(e));const videos=nodes.filter(e=>e.tagName==='VIDEO');const challenge=/扫码登录|验证码|安全验证|重新登录/.test(text);const uploading=/上传中|正在上传|转码中|上传进度|文件上传中|处理中/.test(text);const failed=/上传失败|重新上传并/.test(text)&&!/上传成功/.test(text);const publish=buttons.some(b=>/^(发布|立即发布|确认发布|投稿|立即投稿|提交发布|发表)$/.test((b.textContent||'').trim())&&!b.disabled&&b.getAttribute('aria-disabled')!=='true'&&!String(b.className||'').includes('disabled'));const videoReady=videos.some(v=>(v.currentSrc||v.src||'').includes('finder.video.qq.com')||(Number.isFinite(v.duration)&&v.duration>0&&v.readyState>=1));const uploaded=!failed&&(videoReady||/上传成功|上传完成|视频文件|重新上传|更换视频|移除视频|视频上传信息|封面预览/.test(text));return{challenge,uploading,failed,publish,uploaded,videoReady,text:text.slice(-20000),url:location.href}})()",
+        "(()=>{const visible=e=>!!e&&e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';const roots=[document],nodes=[];for(let i=0;i<roots.length;i++){for(const e of roots[i].querySelectorAll('*')){nodes.push(e);if(e.shadowRoot)roots.push(e.shadowRoot)}}const text=roots.map(root=>root===document?(document.body?.innerText||''):(root.textContent||'')).join(' ');const buttons=nodes.filter(e=>e.matches?.('button,[role=button],div,span')&&visible(e));const videos=nodes.filter(e=>e.tagName==='VIDEO');const challenge=/扫码登录|验证码|安全验证|重新登录/.test(text);const uploading=/上传中|正在上传|转码中|上传进度|文件上传中|处理中/.test(text);const failed=/上传失败|重新上传并/.test(text)&&!/上传成功/.test(text);const publish=buttons.some(b=>/^(发布|立即发布|确认发布|投稿|立即投稿|提交发布|发表)$/.test((b.textContent||'').trim())&&!b.disabled&&b.getAttribute('aria-disabled')!=='true'&&!String(b.className||'').includes('disabled'));const videoReady=videos.some(v=>(v.currentSrc||v.src||'').includes('finder.video.qq.com')||(Number.isFinite(v.duration)&&v.duration>0&&v.readyState>=1));const uploaded=!failed&&(videoReady||/上传成功|上传完成|视频文件|重新上传|更换视频|移除视频|视频上传信息|封面预览/.test(text));const douyinBusy=/上传过程中|文件解析中|文件解析|解析中|上传中|正在上传|转码中|上传进度|文件上传中/.test(text);return{challenge,uploading,failed,publish,uploaded,videoReady,douyinBusy,text:text.slice(-20000),url:location.href}})()",
       );
       if (state.challenge) throw new Error("平台要求登录或安全验证");
       if (
@@ -5437,13 +5583,73 @@ export class BrowserManager {
       // 本地渲染后就有 duration，uploaded 会提前为 true；若不等上传完成
       // 就点发布，平台会静默忽略（2026-11-04 两批实证：clicked=true 但
       // 发布 POST 从未发出，页面也不跳转）
-      if (
-        platform === "douyin" &&
-        state.publish &&
-        !state.uploading &&
-        state.uploaded
-      )
-        return true;
+      //
+      // 2026-11-10 全日志实证补强（原判定漏掉了抖音真实文案）：
+      // 唯一一条 douyin-publish-stuck 现场（11-10 11:25 批点击瞬间）body
+      // 明确写着：
+      //   "上传过程中请不要删除/移动文件 / 0% / 文件解析中，请稍等... /
+      //    取消上传"
+      // 注意两点：
+      //  1) "上传过程中"**不含**连续子串"上传中"（上-传-过-程-中），
+      //     "文件解析中"也不在旧正则词表里 —— 旧 uploading 判定完全漏判。
+      //  2) "重新上传"在解析未完成时就常驻页面，uploaded 因此恒为 true。
+      // 结果：视频仅解析到 0% 就点了发布，平台静默忽略 → 作品不入库。
+      // 这解释了 44 批里 5 批真失败（works 增量恒为 +0）。
+      //
+      // 现在抖音必须同时满足：
+      //  a) 页面无抖音的真实进行中文案（douyinBusy）—— 这是"解析未完成"
+      //     的权威信号（2026-11-10 全日志实证：点击瞬间 stuck 现场
+      //     videos:[] 且 body 写着"上传过程中请不要删除/移动文件 / 0% /
+      //     文件解析中，请稍等..."，而该批 +25 秒后经 CDP 可信点击即
+      //     成功入库；5 批真失败批与之完全吻合）。
+      //  b) 真实 <video> 元素就绪（videoReady）—— 解析中时 videos 为空。
+      // 宽限机制（两路，避免把任务卡死，也避免误点）：
+      //  1) 文案残留：douyinBusy 持续 >180 秒但 videoReady → 放行
+      //     （文案未撤但视频其实已就绪）。
+      //  2) 无 video 元素：douyinBusy 已消失但 videoReady 恒 false
+      //     持续 >90 秒 → 放行（抖音可能用非 <video> 渲染预览，
+      //     此时若死等 videoReady 会一路卡到 600 秒超时）。
+      if (platform === "douyin") {
+        let busyGraceOver = false;
+        let noVideoSince = 0;
+        if (state.douyinBusy && state.videoReady) {
+          if (!douyinBusySince) douyinBusySince = Date.now();
+          if (Date.now() - douyinBusySince < 180000) {
+            await sleep(1500);
+            continue;
+          }
+          // 宽限到期：文案残留但 video 已就绪，放行（并留痕）
+          busyGraceOver = true;
+          await writeBrowserLog(
+            "douyin-publish-ready-busy-grace-expired elapsed=" +
+              String(Date.now() - douyinBusySince),
+          );
+        } else {
+          douyinBusySince = 0;
+        }
+        if (!state.videoReady) {
+          if (!noVideoSince) noVideoSince = Date.now();
+        } else {
+          noVideoSince = 0;
+        }
+        const noVideoGraceOver =
+          !state.videoReady &&
+          !state.douyinBusy &&
+          Date.now() - noVideoSince >= 90000;
+        if (noVideoGraceOver)
+          await writeBrowserLog(
+            "douyin-publish-ready-no-video-grace-expired elapsed=" +
+              String(Date.now() - noVideoSince),
+          );
+        if (
+          state.publish &&
+          (!state.douyinBusy || busyGraceOver) &&
+          (state.videoReady || noVideoGraceOver)
+        )
+          return true;
+        await sleep(1500);
+        continue;
+      }
       if (
         platform !== "toutiao" &&
         state.publish &&
