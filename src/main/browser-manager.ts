@@ -795,43 +795,52 @@ export class BrowserManager {
         // 前端渲染完才出现（2026-10-28 实证：快手 63 秒、B站 2 秒即报
         // "找不到上传控件"，均为页面未渲染完）。这里先等控件出现。
         const inputs = await this.waitForFileInputs(wc, 60000);
+        // 平台侧错误页（"应用加载失败，请刷新重试"）是否出现过、自动刷新
+        // 了几次：用于把失败消息说清楚 —— 2026-11-12 快手实证：外壳正常、
+        // 内容区整段挂掉（版权 footer 都在，非登录/风控），3 轮 reload 全部
+        // 无效，属平台侧故障；旧消息"未找到视频上传控件（页面可能未加载完
+        // 或已改版）"会让用户误以为是工具坏了。
+        let spaBrokenRounds = 0;
+        let spaBrokenSeen = false;
         if (!inputs.length) {
           // 再给几次机会：等待页面出现任何上传相关元素（最多 90 秒）。
           // SPA 内层出现"应用加载失败，请刷新重试"时（2026-11-04 快手
           // 实证：外壳正常、内容区加载失败，干等必然超时），自动重载恢复。
           // 2026-11-05 用户批次实证：单次重载后内层仍失败，需要多轮重载
           // （每轮之间留出渲染窗口，避免连续 reload 打断加载）。
+          // 2026-11-12 快手实证：平台侧故障持续时 3 轮（40 秒内打完）
+          // 太急，故障未恢复就放弃 —— 放宽到 6 轮、间隔 20 秒。
           let reloaded = 0;
           let lastReloadAt = 0;
-          for (let wait = 0; wait < 45; wait += 2) {
+          for (let wait = 0; wait < 75; wait += 2) {
             await sleep(2000);
             const retryInputs = await this.waitForFileInputs(wc, 1000);
             if (retryInputs.length) {
               inputs.push(...retryInputs);
               break;
             }
-            if (reloaded < 3 && Date.now() - lastReloadAt > 15000) {
-              const broken = await wc
-                .executeJavaScript(
-                  "/应用加载失败，请刷新重试|页面加载失败|加载失败，请重试/.test(document.body?.innerText||'')",
-                )
-                .catch(() => false);
-              if (broken) {
-                reloaded += 1;
-                lastReloadAt = Date.now();
-                await writeBrowserLog(
-                  "spa-app-load-failed-reload " +
-                    account.platform +
-                    " round=" +
-                    reloaded +
-                    " url=" +
-                    wc.getURL(),
-                );
-                try {
-                  wc.reload();
-                } catch {
-                  // 窗口可能已销毁，忽略
-                }
+            const broken = await wc
+              .executeJavaScript(
+                "/应用加载失败，请刷新重试|页面加载失败|加载失败，请重试/.test(document.body?.innerText||'')",
+              )
+              .catch(() => false);
+            if (broken) spaBrokenSeen = true;
+            if (broken && reloaded < 6 && Date.now() - lastReloadAt > 20000) {
+              reloaded += 1;
+              spaBrokenRounds = reloaded;
+              lastReloadAt = Date.now();
+              await writeBrowserLog(
+                "spa-app-load-failed-reload " +
+                  account.platform +
+                  " round=" +
+                  reloaded +
+                  " url=" +
+                  wc.getURL(),
+              );
+              try {
+                wc.reload();
+              } catch {
+                // 窗口可能已销毁，忽略
               }
             }
           }
@@ -859,9 +868,25 @@ export class BrowserManager {
             await writeBrowserLog(
               "upload-control-missing " +
                 account.platform +
+                " spaBroken=" +
+                String(spaBrokenSeen) +
+                " reloads=" +
+                String(spaBrokenRounds) +
                 " " +
                 String(snapshot).slice(0, 3200),
             );
+            if (spaBrokenSeen) {
+              // 平台自己的内层应用挂了（外壳正常、非登录/风控）：
+              // 2026-11-12 快手实证，属平台侧故障，等恢复后重发即可
+              return {
+                status: "manual_required" as const,
+                message:
+                  platformMap[account.platform].name +
+                  "平台页面内层应用加载失败（平台侧故障，已自动刷新 " +
+                  String(spaBrokenRounds) +
+                  " 次未恢复，页面快照已记录到日志）。这不是本工具的问题，请稍后点重新发布",
+              };
+            }
             return {
               status: "manual_required" as const,
               message:
