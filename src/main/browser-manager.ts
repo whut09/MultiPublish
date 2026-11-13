@@ -2746,15 +2746,45 @@ export class BrowserManager {
       const declarationSuffix = declarationNotes.length
         ? "；" + declarationNotes.join("、")
         : "";
-      if (verified.ok)
+      if (verified.ok) {
+        // 自测模式兜底：测试内容绝不允许公开挂在用户账号上过夜
+        // （2026-11-13 事故：11-11 两轮自测把"自测验证 MP20261111…"
+        // 公开发布到用户真实抖音账号，公开挂一晚被真实观众看到）。
+        // 验真通过后立即删除刚发的测试作品。四重护栏防误删：
+        //  a) 仅在 MULTIPUBLISH_PUBLISH_SELF_TEST_PLATFORM 存在时进入
+        //     （日常发布永远不带此环境变量）；
+        //  b) 卡片必须同时包含规范化后的完整 30 字自测标题 —— 用户
+        //     真实作品不可能同题；
+        //  c) 只点文本恰好为"删除作品"的元素；
+        //  d) 确认弹窗只点 确认/确定/删除，绝不点取消，且每步截图留证。
+        // 抖音的卡片结构与删除入口有 155 条后台快照实证；其他平台
+        // 删除 DOM 未取证，不盲写 —— 结果消息里强制提醒手动删除。
+        let testWorkNote = "";
+        if (process.env.MULTIPUBLISH_PUBLISH_SELF_TEST_PLATFORM) {
+          if (account.platform === "douyin") {
+            const deleted = await this.deleteTestWork(
+              wc,
+              draft.title,
+            ).catch((error) => ({ ok: false, note: String(error) }));
+            testWorkNote = deleted.ok
+              ? "；自测作品已删除（不留公开痕迹）"
+              : "；⚠自测作品删除失败，请到抖音创作者中心手动删除：" +
+                draft.title;
+          } else {
+            testWorkNote =
+              "；⚠自测模式：请到平台后台手动删除测试作品：" + draft.title;
+          }
+        }
         return {
           status: "success" as const,
           message:
             platformMap[account.platform].name +
             "作品管理已找到目标标题，发布成功：" +
             verified.url +
-            declarationSuffix,
+            declarationSuffix +
+            testWorkNote,
         };
+      }
       if (result.success) {
         if (account.platform === "douyin") {
           // 抖音点击发布后平台要转码处理，作品管理列表可能长时间不出现
@@ -2795,15 +2825,33 @@ export class BrowserManager {
           draft.title,
           180000,
         );
-        if (lateVerified.ok)
+        if (lateVerified.ok) {
+          let testWorkNote = "";
+          if (process.env.MULTIPUBLISH_PUBLISH_SELF_TEST_PLATFORM) {
+            if (account.platform === "douyin") {
+              const deleted = await this.deleteTestWork(
+                wc,
+                draft.title,
+              ).catch((error) => ({ ok: false, note: String(error) }));
+              testWorkNote = deleted.ok
+                ? "；自测作品已删除（不留公开痕迹）"
+                : "；⚠自测作品删除失败，请到抖音创作者中心手动删除：" +
+                  draft.title;
+            } else {
+              testWorkNote =
+                "；⚠自测模式：请到平台后台手动删除测试作品：" + draft.title;
+            }
+          }
           return {
             status: "success" as const,
             message:
               platformMap[account.platform].name +
               "作品管理已找到目标标题，发布成功：" +
               lateVerified.url +
-              declarationSuffix,
+              declarationSuffix +
+              testWorkNote,
           };
+        }
       }
       const diagnostics =
         account.platform === "xiaohongshu"
@@ -5915,6 +5963,174 @@ export class BrowserManager {
       url: lastUrl || wc.getURL(),
       reason: platformMap[platform].name + "作品管理未找到目标标题",
     };
+  }
+  /**
+   * 自测专用：删除刚发布的测试作品（仅抖音）。
+   *
+   * 2026-11-13 事故驱动：11-11 两轮自测把"自测验证 MP20261111…"公开发布
+   * 到用户真实抖音账号，公开挂一晚被真实观众看到。自测模式验真通过后
+   * 必须立即删除，测试内容绝不允许公开挂在用户账号上过夜。
+   *
+   * 护栏（任何一条不满足就放弃，绝不误删）：
+   *  1. 仅当 MULTIPUBLISH_PUBLISH_SELF_TEST_PLATFORM 存在时被调用
+   *     （调用点已保证）；
+   *  2. 卡片规范化文本必须包含完整 30 字自测标题 —— 用户真实作品不可能
+   *     同题；
+   *  3. 只点文本恰好为"删除作品"的可见元素（155 条后台快照实证该入口）；
+   *  4. 确认弹窗只点 确认/确定/删除/确认删除（文本精确匹配，长度≤6），
+   *     绝不碰"取消"；点不进确认弹窗就放弃并留证。
+   * 每步 writeBrowserLog 留痕 + 关键节点截图。
+   */
+  private async deleteTestWork(
+    wc: Electron.WebContents,
+    title: string,
+  ): Promise<{ ok: boolean; note?: string }> {
+    const expected = Array.from(title).slice(0, 30).join("");
+    const norm = (value: string) =>
+      (value || "")
+        .normalize("NFKC")
+        .replace(/[\s\u200b\u200c\u200d\ufeff]+/g, "")
+        .toLowerCase();
+    const want = norm(expected);
+    const manageUrl = "https://creator.douyin.com/creator-micro/content/manage";
+    await writeBrowserLog("testwork-delete begin title=" + title);
+    await wc.loadURL(manageUrl).catch((error) => {
+      if (!/ERR_ABORTED/.test(String(error))) throw error;
+    });
+    await sleep(7000);
+    // 定位并点击目标卡片的"删除作品"入口（轮询 6 次，列表渲染慢时重试）
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const located = await wc
+        .executeJavaScript(
+          "(()=>{const norm=s=>(s||'').normalize('NFKC').replace(/[\\s\\u200b\\u200c\\u200d\\ufeff]+/g,'').toLowerCase();const want=norm(" +
+            JSON.stringify(expected) +
+            ");const vis=e=>!!e&&e.getClientRects?.().length>0;const links=[...document.querySelectorAll('div,span,p,a,button')].filter(vis).filter(e=>e.childElementCount<=1&&(e.textContent||'').trim()==='删除作品');for(const el of links){let card=null;let cur=el;for(let i=0;i<14&&cur;i++){cur=cur.parentElement;if(cur&&norm(cur.innerText).includes(want)){card=cur;break}}if(card){const r=el.getBoundingClientRect();return{found:true,x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),card:(card.innerText||'').slice(0,120),works:(document.body.innerText.match(/作品 \\((\\d+)\\)/)||[])[1]||''}}}return{found:false,works:(document.body.innerText.match(/作品 \\((\\d+)\\)/)||[])[1]||''}})()",
+        )
+        .catch(() => ({ found: false, works: "" }));
+      if (!located?.found) {
+        await writeBrowserLog(
+          "testwork-delete locate-miss attempt=" +
+            attempt +
+            " works=" +
+            String(located?.works ?? ""),
+        );
+        await sleep(4000);
+        continue;
+      }
+      await writeBrowserLog(
+        "testwork-delete located works=" +
+          String(located.works) +
+          " card=" +
+          String(located.card).slice(0, 100),
+      );
+      const shotBefore = await this.captureFailure(wc, "douyin").catch(
+        () => undefined,
+      );
+      // CDP 可信鼠标点击（抖音对 JS click 有静默忽略先例，2026-11-10 实证）
+      if (!wc.debugger.isAttached()) await wc.debugger.attach("1.3");
+      await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x: located.x,
+        y: located.y,
+      });
+      await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+        type: "mousePressed",
+        x: located.x,
+        y: located.y,
+        button: "left",
+        buttons: 1,
+        clickCount: 1,
+      });
+      await sleep(120);
+      await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x: located.x,
+        y: located.y,
+        button: "left",
+        buttons: 0,
+        clickCount: 1,
+      });
+      await writeBrowserLog(
+        "testwork-delete clicked x=" + located.x + " y=" + located.y,
+      );
+      // 等确认弹窗（轮询 5 次），只点 确认/确定/删除/确认删除
+      let confirmed = false;
+      for (let dlg = 0; dlg < 5 && !confirmed; dlg++) {
+        await sleep(1500);
+        const button = await wc
+          .executeJavaScript(
+            "(()=>{const vis=e=>!!e&&e.getClientRects?.().length>0;const candidates=[...document.querySelectorAll('button,[role=button],div,span')].filter(vis).filter(e=>{const t=(e.textContent||'').trim();return t.length<=6&&/^(确认删除|确认|确定|删除)$/.test(t)});if(!candidates.length)return null;const el=candidates[candidates.length-1];const r=el.getBoundingClientRect();return{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),text:(el.textContent||'').trim()}})()",
+          )
+          .catch(() => null);
+        if (!button) continue;
+        await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+          type: "mouseMoved",
+          x: button.x,
+          y: button.y,
+        });
+        await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+          type: "mousePressed",
+          x: button.x,
+          y: button.y,
+          button: "left",
+          buttons: 1,
+          clickCount: 1,
+        });
+        await sleep(120);
+        await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+          type: "mouseReleased",
+          x: button.x,
+          y: button.y,
+          button: "left",
+          buttons: 0,
+          clickCount: 1,
+        });
+        confirmed = true;
+        await writeBrowserLog(
+          "testwork-delete confirm-clicked text=" + button.text,
+        );
+      }
+      if (!confirmed) {
+        const shot = await this.captureFailure(wc, "douyin").catch(
+          () => undefined,
+        );
+        await writeBrowserLog(
+          "testwork-delete no-confirm-dialog shot=" + String(shot),
+        );
+        return { ok: false, note: "未找到删除确认弹窗" };
+      }
+      // 验证：卡片消失（轮询 5 次）
+      for (let check = 0; check < 5; check++) {
+        await sleep(3000);
+        const state = await wc
+          .executeJavaScript(
+            "(()=>{const norm=s=>(s||'').normalize('NFKC').replace(/[\\s\\u200b\\u200c\\u200d\\ufeff]+/g,'').toLowerCase();const want=norm(" +
+              JSON.stringify(expected) +
+              ");const t=document.body?.innerText||'';return{gone:!norm(t.slice(0,30000)).includes(want),works:(t.match(/作品 \\((\\d+)\\)/)||[])[1]||''}})()",
+          )
+          .catch(() => ({ gone: false, works: "" }));
+        if (state?.gone) {
+          await writeBrowserLog(
+            "testwork-delete verified-gone works=" + String(state.works),
+          );
+          return { ok: true };
+        }
+      }
+      const shotAfter = await this.captureFailure(wc, "douyin").catch(
+        () => undefined,
+      );
+      await writeBrowserLog(
+        "testwork-delete still-present shot=" + String(shotAfter),
+      );
+      return { ok: false, note: "点击删除后卡片仍在列表" };
+    }
+    const shotMiss = await this.captureFailure(wc, "douyin").catch(
+      () => undefined,
+    );
+    await writeBrowserLog(
+      "testwork-delete card-not-found shot=" + String(shotMiss),
+    );
+    return { ok: false, note: "作品管理列表未定位到自测卡片" };
   }
   /**
   /**
