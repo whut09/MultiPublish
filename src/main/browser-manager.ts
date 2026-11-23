@@ -2054,6 +2054,37 @@ export class BrowserManager {
         );
         await sleep(1200);
       }
+      // 定时发布（平台原生）：视频上传到编辑页后设置"定时发布"并填时间，
+      // 由平台到点发布，本地无需常驻定时器。2026-11-23 只读探针取证：
+      // 抖音编辑页「发布设置 → 发布时间」含两个 checkbox 样式单选：
+      //   label.radio-d4zkru 文本"立即发布"(value=0,checked) /"定时发布"(value=1)
+      // 选中定时后出现 input.semi-input[placeholder="日期和时间"]
+      //   [format="yyyy-MM-dd HH:mm"]，默认值为 2 小时后
+      // 平台限制文案："支持2小时后及14天内的定时发布"
+      // 小红书/快手定时控件未完整取证（探测时平台故障），暂不盲写。
+      let scheduleNotes: string[] = [];
+      if (draft.scheduledAt && account.platform === "douyin") {
+        const result = await this.setDouyinSchedule(wc, draft.scheduledAt);
+        scheduleNotes = [result.note];
+        await writeBrowserLog(
+          "douyin-schedule-set " +
+            JSON.stringify({ scheduledAt: draft.scheduledAt, ...result }),
+        );
+        if (!result.ok)
+          throw new Error("抖音定时发布设置失败：" + result.note);
+      } else if (draft.scheduledAt) {
+        scheduleNotes = [
+          account.platform === "xiaohongshu"
+            ? "小红书网页端定时发布控件尚未取证，本次已按立即发布处理（请勿依赖定时）"
+            : "该平台定时发布尚未实现，本次已按立即发布处理",
+        ];
+        await writeBrowserLog(
+          "schedule-unsupported platform=" +
+            account.platform +
+            " scheduledAt=" +
+            draft.scheduledAt,
+        );
+      }
       // 声明类选项的勾选结果直接写进任务消息：用户能在界面上看到
       // "原创已勾选"还是"未找到控件"，不再需要靠猜。
       const declarationNotes: string[] = [];
@@ -2743,8 +2774,8 @@ export class BrowserManager {
         // 仍在转码），放宽到 10 分钟
         account.platform === "douyin" ? 600000 : 180000,
       );
-      const declarationSuffix = declarationNotes.length
-        ? "；" + declarationNotes.join("、")
+      const declarationSuffix = [...declarationNotes, ...scheduleNotes].length
+        ? "；" + [...declarationNotes, ...scheduleNotes].join("、")
         : "";
       if (verified.ok) {
         // 自测模式兜底：测试内容绝不允许公开挂在用户账号上过夜
@@ -5962,6 +5993,148 @@ export class BrowserManager {
       ok: false,
       url: lastUrl || wc.getURL(),
       reason: platformMap[platform].name + "作品管理未找到目标标题",
+    };
+  }
+  /**
+   * 抖音定时发布：在编辑页「发布设置 → 发布时间」勾选"定时发布"并填时间。
+   *
+   * 2026-11-23 只读探针 DOM 实证（进入编辑页后）：
+   *   - label.radio-d4zkru 内含 input.radio-native-p6VBGt[value=0|1]，
+   *     文本"立即发布"/"定时发布"；点 label 切换 data-checked
+   *   - 选中定时后出现 input.semi-input[placeholder="日期和时间"]
+   *     [format="yyyy-MM-dd HH:mm"]，值为本地时间 "YYYY-MM-DD HH:mm"
+   *   - 平台限制："支持2小时后及14天内的定时发布"
+   * 时间输入用 CDP DOM.focus + Input.dispatchKeyEvent（semi-design 受控
+   * 组件，JS setter 不会进 React state，必须真实键盘事件）。
+   */
+  private async setDouyinSchedule(
+    wc: Electron.WebContents,
+    scheduledAt: string,
+  ): Promise<{ ok: boolean; note: string }> {
+    const target = new Date(scheduledAt);
+    if (Number.isNaN(target.getTime()))
+      return { ok: false, note: "定时时间格式无效：" + scheduledAt };
+    const now = Date.now();
+    const delta = target.getTime() - now;
+    if (delta < 2 * 3600_000)
+      return { ok: false, note: "抖音要求至少 2 小时后定时发布" };
+    if (delta > 14 * 24 * 3600_000)
+      return { ok: false, note: "抖音要求 14 天以内定时发布" };
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const text =
+      target.getFullYear() +
+      "-" +
+      pad(target.getMonth() + 1) +
+      "-" +
+      pad(target.getDate()) +
+      " " +
+      pad(target.getHours()) +
+      ":" +
+      pad(target.getMinutes());
+
+    if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+    await wc.debugger.sendCommand("DOM.enable");
+    // 1) 勾选"定时发布" label（重试等待控件渲染）
+    let switched = false;
+    for (let i = 0; i < 20 && !switched; i++) {
+      switched = await wc
+        .executeJavaScript(
+          "(()=>{const vis=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0};const labels=[...document.querySelectorAll('label')].filter(vis).filter(e=>/^定时发布$/.test((e.textContent||'').trim()));const el=labels[labels.length-1];if(!el)return false;if(el.getAttribute('data-checked')==='true')return true;el.click();return el.getAttribute('data-checked')==='true'})()",
+        )
+        .catch(() => false);
+      if (!switched) await sleep(1000);
+    }
+    if (!switched)
+      return { ok: false, note: "未找到抖音「定时发布」单选控件" };
+    // 2) 等时间输入框出现
+    let timeInput: { backendNodeId: number; value: string } | undefined;
+    for (let i = 0; i < 20 && !timeInput; i++) {
+      const flat = await wc.debugger.sendCommand("DOM.getFlattenedDocument", {
+        depth: -1,
+        pierce: true,
+      });
+      const node = (flat.nodes as Array<{
+        nodeName: string;
+        backendNodeId?: number;
+        attributes?: string[];
+        nodeValue?: string;
+      }>).find((n) => {
+        if (n.nodeName !== "INPUT" || !n.backendNodeId) return false;
+        const attrs = n.attributes || [];
+        const map = new Map<string, string>();
+        for (let k = 0; k < attrs.length; k += 2)
+          map.set(attrs[k], attrs[k + 1] || "");
+        return (
+          map.get("placeholder") === "日期和时间" ||
+          map.get("format") === "yyyy-MM-dd HH:mm"
+        );
+      });
+      if (node?.backendNodeId) {
+        timeInput = { backendNodeId: node.backendNodeId, value: "" };
+        break;
+      }
+      await sleep(1000);
+    }
+    if (!timeInput)
+      return { ok: false, note: "未找到抖音定时时间输入框" };
+    // 3) CDP 真实键盘输入：focus → 全选 → 逐字输入 → Tab 失焦提交
+    await wc.debugger.sendCommand("DOM.focus", {
+      backendNodeId: timeInput.backendNodeId,
+    });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "rawKeyDown",
+      key: "a",
+      code: "KeyA",
+      windowsVirtualKeyCode: 65,
+      modifiers: 2,
+    });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: "a",
+      code: "KeyA",
+      windowsVirtualKeyCode: 65,
+      modifiers: 2,
+    });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "rawKeyDown",
+      key: "Backspace",
+      code: "Backspace",
+      windowsVirtualKeyCode: 8,
+    });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: "Backspace",
+      code: "Backspace",
+      windowsVirtualKeyCode: 8,
+    });
+    await wc.debugger.sendCommand("Input.insertText", { text });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyDown",
+      key: "Tab",
+      code: "Tab",
+      windowsVirtualKeyCode: 9,
+    });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: "Tab",
+      code: "Tab",
+      windowsVirtualKeyCode: 9,
+    });
+    await sleep(1500);
+    // 4) 回读校验：时间输入值 + 定时单选仍选中
+    const state = await wc
+      .executeJavaScript(
+        "(()=>{const inputs=[...document.querySelectorAll('input')];const t=inputs.find(e=>e.getAttribute('placeholder')==='日期和时间'||e.getAttribute('format')==='yyyy-MM-dd HH:mm');const l=[...document.querySelectorAll('label')].find(e=>/^定时发布$/.test((e.textContent||'').trim()));return{value:t?.value||'',checked:l?.getAttribute('data-checked')==='true'}})()",
+      )
+      .catch(() => ({ value: "", checked: false }));
+    if (!state?.checked || !state?.value)
+      return {
+        ok: false,
+        note: "定时设置未生效（checked=" + String(state?.checked) + "）",
+      };
+    return {
+      ok: true,
+      note: "已设为定时发布 " + state.value + "（平台到点自动发布）",
     };
   }
   /**

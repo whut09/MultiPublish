@@ -110,6 +110,12 @@ function parseAppData(value: unknown): AppData {
       douyinSyncTargets: douyinSyncTargets.length
         ? douyinSyncTargets
         : undefined,
+      // 定时发布时间：只接受能解析且落在未来的 ISO 字符串，旧数据无此字段
+      scheduledAt:
+        isString(draft.scheduledAt) &&
+        !Number.isNaN(Date.parse(draft.scheduledAt))
+          ? draft.scheduledAt
+          : undefined,
       createdAt: isString(draft.createdAt)
         ? draft.createdAt
         : new Date(0).toISOString(),

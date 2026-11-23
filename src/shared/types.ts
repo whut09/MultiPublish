@@ -40,6 +40,8 @@ export interface PublishDraft {
   declareOriginal?: boolean;
   /** 抖音发布时同步发送到的平台（需已在抖音绑定对应账号） */
   douyinSyncTargets?: DouyinSyncTarget[];
+  /** 定时发布时间（ISO 8601）。设置后走平台原生定时发布，不立即发布。 */
+  scheduledAt?: string;
   createdAt: string;
 }
 export interface PublishTask {

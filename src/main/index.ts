@@ -779,7 +779,9 @@ function ipc() {
               platform: a.platform,
               title: created.title,
               status: "pending",
-              message: "等待自动发布",
+              message: created.scheduledAt
+                ? "已提交，等待平台定时发布：" + created.scheduledAt
+                : "等待自动发布",
               createdAt: now,
               updatedAt: now,
             });

@@ -5,6 +5,7 @@ import {
   Button,
   Card,
   Checkbox,
+  DatePicker,
   Empty,
   Form,
   Input,
@@ -32,6 +33,7 @@ import {
   UploadOutlined,
   VideoCameraOutlined,
 } from "@ant-design/icons";
+import dayjs from "dayjs";
 import type {
   Account,
   AppData,
@@ -368,6 +370,7 @@ function Publish({
     [tags, setTags] = useState<string[]>([]),
     [tagInput, setTagInput] = useState(""),
     [declareOriginal, setDeclareOriginal] = useState(false),
+    [scheduledAt, setScheduledAt] = useState<dayjs.Dayjs | null>(null),
     [form] = Form.useForm();
   const extractCoverWithTimeout = (videoPath: string) =>
     Promise.race([
@@ -382,6 +385,7 @@ function Publish({
     setCover([]);
     setCoverPreview("");
     setTags([]);
+    setScheduledAt(null);
     const saved = data.accountSelections[type];
     if (data.accounts.length) {
       form.setFieldsValue({
@@ -424,10 +428,15 @@ function Publish({
         coverPath: cover[0],
         accountIds: value.accountIds,
         declareOriginal: declareOriginal || undefined,
+        scheduledAt: scheduledAt ? scheduledAt.toISOString() : undefined,
       });
       hide();
       setData(created);
-      message.success("一键发布已开始，可在发布记录查看进度");
+      message.success(
+        scheduledAt
+          ? "定时发布已提交，由平台在设定时间自动发布"
+          : "一键发布已开始，可在发布记录查看进度",
+      );
       window.multiPublish
         .autoPublish(created.drafts[0].id)
         .then(setData)
@@ -722,6 +731,27 @@ function Publish({
                   );
                 }}
               </Form.Item>
+              <Form.Item label="定时发布">
+                <Space direction="vertical" style={{ width: "100%" }}>
+                  <DatePicker
+                    showTime
+                    format="YYYY-MM-DD HH:mm"
+                    placeholder="不填则立即发布"
+                    value={scheduledAt}
+                    disabledDate={(d) =>
+                      d && d.isBefore(dayjs().add(1, "hour"), "day")
+                    }
+                    disabledTime={() => ({})}
+                    onChange={(v) => setScheduledAt(v)}
+                    style={{ width: "100%" }}
+                    allowClear
+                  />
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    抖音走平台原生定时发布（支持 2 小时后、14 天内）；不填则立即发布。
+                    小红书/快手目前暂不支持，设置后仍立即发布。
+                  </Typography.Text>
+                </Space>
+              </Form.Item>
               <Button
                 type="primary"
                 size="large"
@@ -730,7 +760,7 @@ function Publish({
                 disabled={!data.accounts.length || submitting}
                 loading={submitting}
               >
-                一键发布
+                {scheduledAt ? "定时发布" : "一键发布"}
               </Button>
             </Form>
           </Card>
