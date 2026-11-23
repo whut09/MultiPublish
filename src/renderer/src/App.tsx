@@ -747,8 +747,8 @@ function Publish({
                     allowClear
                   />
                   <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                    抖音走平台原生定时发布（支持 2 小时后、14 天内）；不填则立即发布。
-                    小红书/快手目前暂不支持，设置后仍立即发布。
+                    抖音/小红书/快手走平台原生定时发布，由平台到点自动发布；不填则立即发布。
+                    抖音要求 2 小时后、14 天内。其他平台暂不支持，会按立即发布处理。
                   </Typography.Text>
                 </Space>
               </Form.Item>

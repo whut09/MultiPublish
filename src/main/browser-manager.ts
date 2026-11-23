@@ -2061,23 +2061,39 @@ export class BrowserManager {
       // 选中定时后出现 input.semi-input[placeholder="日期和时间"]
       //   [format="yyyy-MM-dd HH:mm"]，默认值为 2 小时后
       // 平台限制文案："支持2小时后及14天内的定时发布"
-      // 小红书/快手定时控件未完整取证（探测时平台故障），暂不盲写。
+      // 小红书（2026-11-23 取证）：「更多设置 → 定时发布」开关
+      //   .custom-switch-switch .d-switch-simulator（unchecked→checked），
+      //   打开后出现时间控件。注意 .custom-switch-icon 只是图标不是开关。
+      // 快手（2026-11-23 取证）：「发布设置 → 发布时间」antd radio
+      //   label.ant-radio-wrapper 文本"立即发布"(value=1,checked)/"定时发布"
+      //   (value=2)，选中后 input[placeholder="选择日期时间"] 从 readonly
+      //   变为可编辑（上传未完成时为 readonly），格式 YYYY-MM-DD HH:mm。
       let scheduleNotes: string[] = [];
-      if (draft.scheduledAt && account.platform === "douyin") {
-        const result = await this.setDouyinSchedule(wc, draft.scheduledAt);
+      if (
+        draft.scheduledAt &&
+        ["douyin", "xiaohongshu", "kuaishou"].includes(account.platform)
+      ) {
+        const result =
+          account.platform === "douyin"
+            ? await this.setDouyinSchedule(wc, draft.scheduledAt)
+            : account.platform === "xiaohongshu"
+              ? await this.setXhsSchedule(wc, draft.scheduledAt)
+              : await this.setKuaishouSchedule(wc, draft.scheduledAt);
         scheduleNotes = [result.note];
         await writeBrowserLog(
-          "douyin-schedule-set " +
+          "schedule-set platform=" +
+            account.platform +
+            " " +
             JSON.stringify({ scheduledAt: draft.scheduledAt, ...result }),
         );
         if (!result.ok)
-          throw new Error("抖音定时发布设置失败：" + result.note);
+          throw new Error(
+            platformMap[account.platform].name +
+              "定时发布设置失败：" +
+              result.note,
+          );
       } else if (draft.scheduledAt) {
-        scheduleNotes = [
-          account.platform === "xiaohongshu"
-            ? "小红书网页端定时发布控件尚未取证，本次已按立即发布处理（请勿依赖定时）"
-            : "该平台定时发布尚未实现，本次已按立即发布处理",
-        ];
+        scheduleNotes = ["该平台定时发布尚未实现，本次已按立即发布处理"];
         await writeBrowserLog(
           "schedule-unsupported platform=" +
             account.platform +
@@ -6131,6 +6147,223 @@ export class BrowserManager {
       return {
         ok: false,
         note: "定时设置未生效（checked=" + String(state?.checked) + "）",
+      };
+    return {
+      ok: true,
+      note: "已设为定时发布 " + state.value + "（平台到点自动发布）",
+    };
+  }
+  /**
+   * 将 ISO 时间转成平台通用的本地 "YYYY-MM-DD HH:mm" 字符串。
+   * 各平台的日期输入框都按用户本地时区显示（抖音/小红书/快手实测一致）。
+   */
+  private formatScheduleTime(scheduledAt: string) {
+    const target = new Date(scheduledAt);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return (
+      target.getFullYear() +
+      "-" +
+      pad(target.getMonth() + 1) +
+      "-" +
+      pad(target.getDate()) +
+      " " +
+      pad(target.getHours()) +
+      ":" +
+      pad(target.getMinutes())
+    );
+  }
+  /** 用 CDP 真实键盘把一个受控 input 改成目标文本并失焦提交。 */
+  private async typeScheduleInput(
+    wc: Electron.WebContents,
+    backendNodeId: number,
+    text: string,
+  ) {
+    if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+    await wc.debugger.sendCommand("DOM.focus", { backendNodeId });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "rawKeyDown",
+      key: "a",
+      code: "KeyA",
+      windowsVirtualKeyCode: 65,
+      modifiers: 2,
+    });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: "a",
+      code: "KeyA",
+      windowsVirtualKeyCode: 65,
+      modifiers: 2,
+    });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "rawKeyDown",
+      key: "Backspace",
+      code: "Backspace",
+      windowsVirtualKeyCode: 8,
+    });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: "Backspace",
+      code: "Backspace",
+      windowsVirtualKeyCode: 8,
+    });
+    await wc.debugger.sendCommand("Input.insertText", { text });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyDown",
+      key: "Tab",
+      code: "Tab",
+      windowsVirtualKeyCode: 9,
+    });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: "Tab",
+      code: "Tab",
+      windowsVirtualKeyCode: 9,
+    });
+    await sleep(1500);
+  }
+  /**
+   * 小红书定时发布：「更多设置 → 定时发布」开关 + 时间控件。
+   *
+   * 2026-11-23 只读探针 DOM 实证：
+   *   .post-time-wrapper .custom-switch-switch .d-switch-simulator.unchecked
+   *   内含 input[type=checkbox]；注意 .custom-switch-icon 只是时钟图标，
+   *   点它不会切换开关（前两轮探测就是点了图标没生效）。
+   * 打开后需等待时间控件出现（上传未完成时不渲染）。
+   */
+  private async setXhsSchedule(
+    wc: Electron.WebContents,
+    scheduledAt: string,
+  ): Promise<{ ok: boolean; note: string }> {
+    const target = new Date(scheduledAt);
+    if (Number.isNaN(target.getTime()))
+      return { ok: false, note: "定时时间格式无效：" + scheduledAt };
+    const text = this.formatScheduleTime(scheduledAt);
+    if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+    await wc.debugger.sendCommand("DOM.enable");
+    // 1) 点 d-switch-simulator（真正开关），轮询等它变 checked
+    let switched = false;
+    for (let i = 0; i < 20 && !switched; i++) {
+      switched = await wc
+        .executeJavaScript(
+          "(()=>{const sw=document.querySelector('.post-time-wrapper .d-switch-simulator');if(!sw)return false;if(!sw.classList.contains('unchecked'))return true;sw.click();return !sw.classList.contains('unchecked')})()",
+        )
+        .catch(() => false);
+      if (!switched) await sleep(1000);
+    }
+    if (!switched)
+      return { ok: false, note: "未找到小红书「定时发布」开关" };
+    // 2) 等时间控件出现（上传未完成时不会渲染）。用 JS focus +
+    //    CDP Input.insertText，不依赖 backendNodeId（多 frame 查询不稳）。
+    let focused = false;
+    for (let i = 0; i < 30 && !focused; i++) {
+      focused = await wc
+        .executeJavaScript(
+          "(()=>{const el=document.querySelector('.post-time-wrapper .date-picker-container input');if(!el)return false;el.focus();el.select?.();return document.activeElement===el})()",
+        )
+        .catch(() => false);
+      if (!focused) await sleep(1000);
+    }
+    if (!focused)
+      return {
+        ok: false,
+        note: "定时开关已打开但未找到时间输入框（视频可能仍在上传）",
+      };
+    // 3) CDP 真实键盘输入（焦点已在 input 上）
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "rawKeyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2,
+    });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2,
+    });
+    await wc.debugger.sendCommand("Input.insertText", { text });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyDown", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9,
+    });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9,
+    });
+    await sleep(1500);
+    const state = await wc
+      .executeJavaScript(
+        "(()=>{const sw=document.querySelector('.post-time-wrapper .d-switch-simulator');const el=document.querySelector('.post-time-wrapper .date-picker-container input');return{checked:sw?!sw.classList.contains('unchecked'):false,value:el?.value||''}})()",
+      )
+      .catch(() => ({ checked: false, value: "" }));
+    if (!state?.checked || !state?.value)
+      return {
+        ok: false,
+        note: "小红书定时设置未生效（checked=" + String(state?.checked) + "）",
+      };
+    return {
+      ok: true,
+      note: "已设为定时发布 " + state.value + "（平台到点自动发布）",
+    };
+  }
+  /**
+   * 快手定时发布：「发布设置 → 发布时间」antd radio + 日期输入框。
+   *
+   * 2026-11-23 只读探针 DOM 实证：
+   *   label.ant-radio-wrapper 文本"立即发布"(value=1,checked)/"定时发布"
+   *   (value=2)；选中后 input[placeholder="选择日期时间"] 从 readonly
+   *   变为可编辑（上传未完成时为 readonly，故设置前需等上传完成）。
+   */
+  private async setKuaishouSchedule(
+    wc: Electron.WebContents,
+    scheduledAt: string,
+  ): Promise<{ ok: boolean; note: string }> {
+    const target = new Date(scheduledAt);
+    if (Number.isNaN(target.getTime()))
+      return { ok: false, note: "定时时间格式无效：" + scheduledAt };
+    const text = this.formatScheduleTime(scheduledAt);
+    if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+    await wc.debugger.sendCommand("DOM.enable");
+    // 1) 点"定时发布" radio（轮询等待）
+    let switched = false;
+    for (let i = 0; i < 20 && !switched; i++) {
+      switched = await wc
+        .executeJavaScript(
+          "(()=>{const ls=[...document.querySelectorAll('label.ant-radio-wrapper')].filter(e=>/^定时发布/.test((e.textContent||'').trim()));const el=ls[ls.length-1];if(!el)return false;const input=el.querySelector('input');if(input?.checked)return true;el.click();return !!el.querySelector('input')?.checked})()",
+        )
+        .catch(() => false);
+      if (!switched) await sleep(1000);
+    }
+    if (!switched)
+      return { ok: false, note: "未找到快手「定时发布」单选控件" };
+    // 2) 等日期输入框可编辑 + JS focus（不依赖 backendNodeId）
+    let focused = false;
+    for (let i = 0; i < 40 && !focused; i++) {
+      focused = await wc
+        .executeJavaScript(
+          "(()=>{const el=[...document.querySelectorAll('input')].find(e=>e.getAttribute('placeholder')==='选择日期时间');if(!el||el.hasAttribute('readonly'))return false;el.focus();el.select?.();return document.activeElement===el})()",
+        )
+        .catch(() => false);
+      if (!focused) await sleep(1500);
+    }
+    if (!focused)
+      return { ok: false, note: "快手日期输入框始终只读或不存在（视频可能仍在上传）" };
+    // 3) CDP 真实键盘输入
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "rawKeyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2,
+    });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2,
+    });
+    await wc.debugger.sendCommand("Input.insertText", { text });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyDown", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9,
+    });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
+      type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9,
+    });
+    await sleep(1500);
+    const state = await wc
+      .executeJavaScript(
+        "(()=>{const el=[...document.querySelectorAll('input')].find(e=>e.getAttribute('placeholder')==='选择日期时间');const l=[...document.querySelectorAll('label.ant-radio-wrapper')].find(e=>/^定时发布/.test((e.textContent||'').trim()));return{value:el?.value||'',checked:!!l?.querySelector('input')?.checked}})()",
+      )
+      .catch(() => ({ value: "", checked: false }));
+    if (!state?.checked || !state?.value)
+      return {
+        ok: false,
+        note: "快手定时设置未生效（checked=" + String(state?.checked) + "）",
       };
     return {
       ok: true,
