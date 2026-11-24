@@ -418,6 +418,20 @@ function Publish({
         message.error(type === "video" ? "请选择视频文件" : "请选择图片素材");
         return;
       }
+      if (scheduledAt) {
+        // 抖音平台要求至少 2 小时后；并发任务排队会消耗时间（2026-11-24
+        // 事故：设 11:15、抖音任务 09:18 才执行，只剩 1h57m 被平台拒绝），
+        // 因此提交时要求至少 2.5 小时缓冲。
+        const remain = scheduledAt.diff(dayjs(), "minute");
+        if (remain < 150) {
+          message.error("定时发布请选至少 2.5 小时后的时间（平台要求 2 小时，需预留任务排队时间）");
+          return;
+        }
+        if (remain > 14 * 24 * 60) {
+          message.error("定时发布时间不能超过 14 天后");
+          return;
+        }
+      }
       const hide = message.loading("正在准备发布任务并提取封面…", 0);
       const created = await window.multiPublish.createPublish({
         type,
@@ -739,9 +753,34 @@ function Publish({
                     placeholder="不填则立即发布"
                     value={scheduledAt}
                     disabledDate={(d) =>
-                      d && d.isBefore(dayjs().add(1, "hour"), "day")
+                      d && d.isBefore(dayjs(), "day")
                     }
-                    disabledTime={() => ({})}
+                    disabledTime={(now) => {
+                      // 抖音要求 2 小时后，任务排队会吃时间 → 禁 2.5 小时内
+                      const earliest = dayjs().add(150, "minute");
+                      if (!now || !now.isSame(dayjs(), "day"))
+                        return { disabledHours: () => [], disabledMinutes: () => [] };
+                      return {
+                        disabledHours: () =>
+                          Array.from({ length: 24 }, (_, h) => h).filter(
+                            (h) =>
+                              dayjs()
+                                .hour(h)
+                                .minute(0)
+                                .isBefore(earliest),
+                          ),
+                        disabledMinutes: (hour: number) => {
+                          if (hour !== earliest.hour()) return [];
+                          return Array.from({ length: 60 }, (_, m) => m).filter(
+                            (m) =>
+                              dayjs()
+                                .hour(hour)
+                                .minute(m)
+                                .isBefore(earliest),
+                          );
+                        },
+                      };
+                    }}
                     onChange={(v) => setScheduledAt(v)}
                     style={{ width: "100%" }}
                     allowClear

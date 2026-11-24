@@ -2069,6 +2069,9 @@ export class BrowserManager {
       //   (value=2)，选中后 input[placeholder="选择日期时间"] 从 readonly
       //   变为可编辑（上传未完成时为 readonly），格式 YYYY-MM-DD HH:mm。
       let scheduleNotes: string[] = [];
+      // 定时设置是否成功：成功后平台不会把作品立即放进"已发布"列表
+      // （在"待发布/定时任务"里），因此后续验真逻辑不同（见下方分支）。
+      let scheduleSetOk = false;
       if (
         draft.scheduledAt &&
         ["douyin", "xiaohongshu", "kuaishou"].includes(account.platform)
@@ -2092,6 +2095,7 @@ export class BrowserManager {
               "定时发布设置失败：" +
               result.note,
           );
+        scheduleSetOk = true;
       } else if (draft.scheduledAt) {
         scheduleNotes = ["该平台定时发布尚未实现，本次已按立即发布处理"];
         await writeBrowserLog(
@@ -2793,6 +2797,39 @@ export class BrowserManager {
       const declarationSuffix = [...declarationNotes, ...scheduleNotes].length
         ? "；" + [...declarationNotes, ...scheduleNotes].join("、")
         : "";
+      // 定时发布的作品不会立即进"已发布"列表（在"待发布/定时任务"里），
+      // 用列表标题验真必然 miss（2026-11-24 用户批次实证：小红书/快手
+      // 定时设置 ok=true、平台已跳管理页，却被验真误判失败）。
+      // 定时场景：设置成功 + 平台确认提交（跳到管理页或出现成功提示）
+      // 即视为成功；消息明确告诉用户"由平台到点发布"。
+      if (scheduleSetOk) {
+        const url = wc.getURL();
+        const submitted =
+          result.success ||
+          /\/manage|\/note-manager/.test(url) ||
+          (await wc
+            .executeJavaScript(
+              "/定时发布成功|预约发布成功|发布成功|提交成功/.test(document.body?.innerText||'')",
+            )
+            .catch(() => false));
+        await writeBrowserLog(
+          "schedule-submit-check " +
+            JSON.stringify({ platform: account.platform, submitted, url }),
+        );
+        if (submitted) {
+          return {
+            status: "success" as const,
+            message:
+              platformMap[account.platform].name +
+              "定时发布已提交（" +
+              (draft.scheduledAt || "") +
+              "），由平台到点自动发布；" +
+              scheduleNotes.join("、") +
+              declarationSuffix,
+          };
+        }
+        // 没确认提交：不能判成功，交给下方常规验真/失败处理
+      }
       if (verified.ok) {
         // 自测模式兜底：测试内容绝不允许公开挂在用户账号上过夜
         // （2026-11-13 事故：11-11 两轮自测把"自测验证 MP20261111…"
@@ -6033,7 +6070,15 @@ export class BrowserManager {
     const now = Date.now();
     const delta = target.getTime() - now;
     if (delta < 2 * 3600_000)
-      return { ok: false, note: "抖音要求至少 2 小时后定时发布" };
+      // 2026-11-24 用户批次：并发排队导致任务真正执行时距目标不足 2 小时，
+      // 平台拒绝。提示要可操作 —— 明确说清剩余时间与解决方式。
+      return {
+        ok: false,
+        note:
+          "距设定时间只剩 " +
+          Math.max(0, Math.floor(delta / 60000)) +
+          " 分钟，抖音要求至少 2 小时后（任务排队消耗了时间）；请选更晚的时间后重新发布",
+      };
     if (delta > 14 * 24 * 3600_000)
       return { ok: false, note: "抖音要求 14 天以内定时发布" };
     const pad = (n: number) => String(n).padStart(2, "0");
