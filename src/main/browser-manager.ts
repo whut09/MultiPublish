@@ -6257,21 +6257,40 @@ export class BrowserManager {
       windowsVirtualKeyCode: 9,
     });
     await sleep(1500);
-    // 4) 回读校验：时间输入值 + 定时单选仍选中
-    const state = await wc
-      .executeJavaScript(
-        "(()=>{const inputs=[...document.querySelectorAll('input')];const t=inputs.find(e=>e.getAttribute('placeholder')==='日期和时间'||e.getAttribute('format')==='yyyy-MM-dd HH:mm');const l=[...document.querySelectorAll('label')].find(e=>/^定时发布$/.test((e.textContent||'').trim()));return{value:t?.value||'',checked:l?.getAttribute('data-checked')==='true'}})()",
-      )
-      .catch(() => ({ value: "", checked: false }));
-    if (!state?.checked || !state?.value)
+    // 4) 严格回读：值必须**完全等于**目标时间。2026-11-24 用户批次实证：
+    //    Ctrl+A 没选中旧值时 insertText 把新时间**追加**成
+    //    "21:252026-11-24 22:00"，只检查非空会误判成功、平台却用错误时间。
+    let state = await this.readDouyinSchedule(wc);
+    if (!state.checked || state.value !== text) {
+      // 强重试：JS 全选 + 删除，再 insertText（最多 3 次）
+      for (let retry = 0; retry < 3 && (!state.checked || state.value !== text); retry++) {
+        await wc.executeJavaScript(
+          "(()=>{const t=[...document.querySelectorAll('input')].find(e=>e.getAttribute('placeholder')==='日期和时间'||e.getAttribute('format')==='yyyy-MM-dd HH:mm');if(!t)return;const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;setter?.call(t,'');t.dispatchEvent(new Event('input',{bubbles:true}));t.focus();t.select()})()",
+        ).catch(() => undefined);
+        await wc.debugger.sendCommand("Input.insertText", { text });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyDown", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+        await sleep(1200);
+        state = await this.readDouyinSchedule(wc);
+      }
+    }
+    await writeBrowserLog("douyin-schedule-verify " + JSON.stringify({ want: text, got: state.value, checked: state.checked }));
+    if (!state.checked || state.value !== text)
       return {
         ok: false,
-        note: "定时设置未生效（checked=" + String(state?.checked) + "）",
+        note: "定时时间未正确写入（目标 " + text + "，实际 " + state.value + "），已放弃，避免用错误时间发布",
       };
     return {
       ok: true,
       note: "已设为定时发布 " + state.value + "（平台到点自动发布）",
     };
+  }
+  private async readDouyinSchedule(wc: Electron.WebContents) {
+    return (await wc
+      .executeJavaScript(
+        "(()=>{const inputs=[...document.querySelectorAll('input')];const t=inputs.find(e=>e.getAttribute('placeholder')==='日期和时间'||e.getAttribute('format')==='yyyy-MM-dd HH:mm');const l=[...document.querySelectorAll('label')].find(e=>/^定时发布$/.test((e.textContent||'').trim()));return{value:t?.value||'',checked:l?.getAttribute('data-checked')==='true'}})()",
+      )
+      .catch(() => ({ value: "", checked: false }))) as { value: string; checked: boolean };
   }
   /**
    * 将 ISO 时间转成平台通用的本地 "YYYY-MM-DD HH:mm" 字符串。
@@ -6403,15 +6422,26 @@ export class BrowserManager {
       type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9,
     });
     await sleep(1500);
-    const state = await wc
+    let state = await wc
       .executeJavaScript(
         "(()=>{const sw=document.querySelector('.post-time-wrapper .d-switch-simulator');const el=document.querySelector('.post-time-wrapper .date-picker-container input');return{checked:sw?!sw.classList.contains('unchecked'):false,value:el?.value||''}})()",
       )
       .catch(() => ({ checked: false, value: "" }));
-    if (!state?.checked || !state?.value)
+    if (!state?.checked || state?.value !== text) {
+      for (let retry = 0; retry < 3 && (!state?.checked || state?.value !== text); retry++) {
+        await wc.executeJavaScript("(()=>{const el=document.querySelector('.post-time-wrapper .date-picker-container input');if(!el)return;const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;setter?.call(el,'');el.dispatchEvent(new Event('input',{bubbles:true}));el.focus();el.select?.()})()").catch(() => undefined);
+        await wc.debugger.sendCommand("Input.insertText", { text });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyDown", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+        await sleep(1200);
+        state = await wc.executeJavaScript("(()=>{const sw=document.querySelector('.post-time-wrapper .d-switch-simulator');const el=document.querySelector('.post-time-wrapper .date-picker-container input');return{checked:sw?!sw.classList.contains('unchecked'):false,value:el?.value||''}})()").catch(() => ({ checked: false, value: "" }));
+      }
+    }
+    await writeBrowserLog("xiaohongshu-schedule-verify " + JSON.stringify({ want: text, got: state?.value, checked: state?.checked }));
+    if (!state?.checked || state?.value !== text)
       return {
         ok: false,
-        note: "小红书定时设置未生效（checked=" + String(state?.checked) + "）",
+        note: "定时时间未正确写入（目标 " + text + "，实际 " + String(state?.value) + "），已放弃，避免用错误时间发布",
       };
     return {
       ok: true,
@@ -6496,20 +6526,37 @@ export class BrowserManager {
       type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9,
     });
     await sleep(1500);
-    const state = await wc
-      .executeJavaScript(
-        "(()=>{const el=[...document.querySelectorAll('input')].find(e=>e.getAttribute('placeholder')==='选择日期时间');const l=[...document.querySelectorAll('label.ant-radio-wrapper')].find(e=>/^定时发布/.test((e.textContent||'').trim()));return{value:el?.value||'',checked:!!l?.querySelector('input')?.checked}})()",
-      )
-      .catch(() => ({ value: "", checked: false }));
-    if (!state?.checked || !state?.value)
+    let state = await this.readKuaishouSchedule(wc);
+    if (!state.checked || state.value !== text) {
+      // 2026-11-24 事故：回读只查非空 → 平台保存了打开开关时的默认值
+      // （当前+1h），与目标不符。强重试直到完全一致。
+      for (let retry = 0; retry < 3 && (!state.checked || state.value !== text); retry++) {
+        const hit = await wc.executeJavaScript("(()=>{const e=[...document.querySelectorAll('input')].find(x=>x.getAttribute('placeholder')==='选择日期时间');if(!e)return false;const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;setter?.call(e,'');e.dispatchEvent(new Event('input',{bubbles:true}));e.focus();e.select?.();return true})()").catch(() => false);
+        if (!hit) break;
+        await wc.debugger.sendCommand("Input.insertText", { text });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyDown", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+        await wc.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+        await sleep(1200);
+        state = await this.readKuaishouSchedule(wc);
+      }
+    }
+    await writeBrowserLog("kuaishou-schedule-verify " + JSON.stringify({ want: text, got: state.value, checked: state.checked }));
+    if (!state.checked || state.value !== text)
       return {
         ok: false,
-        note: "快手定时设置未生效（checked=" + String(state?.checked) + "）",
+        note: "定时时间未正确写入（目标 " + text + "，实际 " + state.value + "），已放弃，避免用错误时间发布",
       };
     return {
       ok: true,
       note: "已设为定时发布 " + state.value + "（平台到点自动发布）",
     };
+  }
+  private async readKuaishouSchedule(wc: Electron.WebContents) {
+    return (await wc
+      .executeJavaScript(
+        "(()=>{const el=[...document.querySelectorAll('input')].find(e=>e.getAttribute('placeholder')==='选择日期时间');const l=[...document.querySelectorAll('label.ant-radio-wrapper')].find(e=>/^定时发布/.test((e.textContent||'').trim()));return{value:el?.value||'',checked:!!l?.querySelector('input')?.checked}})()",
+      )
+      .catch(() => ({ value: "", checked: false }))) as { value: string; checked: boolean };
   }
   /**
    * 自测专用：删除刚发布的测试作品（仅抖音）。
