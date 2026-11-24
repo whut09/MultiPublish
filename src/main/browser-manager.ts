@@ -2074,14 +2074,20 @@ export class BrowserManager {
       let scheduleSetOk = false;
       if (
         draft.scheduledAt &&
-        ["douyin", "xiaohongshu", "kuaishou"].includes(account.platform)
+        ["douyin", "xiaohongshu", "kuaishou", "toutiao", "bilibili"].includes(
+          account.platform,
+        )
       ) {
         const result =
           account.platform === "douyin"
             ? await this.setDouyinSchedule(wc, draft.scheduledAt)
             : account.platform === "xiaohongshu"
               ? await this.setXhsSchedule(wc, draft.scheduledAt)
-              : await this.setKuaishouSchedule(wc, draft.scheduledAt);
+              : account.platform === "kuaishou"
+                ? await this.setKuaishouSchedule(wc, draft.scheduledAt)
+                : account.platform === "bilibili"
+                  ? await this.setBilibiliSchedule(wc, draft.scheduledAt)
+                  : await this.setToutiaoSchedule(wc, draft.scheduledAt);
         scheduleNotes = [result.note];
         await writeBrowserLog(
           "schedule-set platform=" +
@@ -6559,6 +6565,151 @@ export class BrowserManager {
       .catch(() => ({ value: "", checked: false }))) as { value: string; checked: boolean };
   }
   /**
+   * B站定时发布：编辑页「定时发布」开关（.time-container .switch-container，
+   * 2026-11-24 DOM 取证；平台规则"最早≥5分钟、最晚≤15天"）。
+   * 注意：B站发文量大时会被短信验证弹窗挡住（input.sms-cell），此时
+   * 开关点不动 —— 明确告知用户，不做无效空等。
+   */
+  private async setBilibiliSchedule(
+    wc: Electron.WebContents,
+    scheduledAt: string,
+  ): Promise<{ ok: boolean; note: string }> {
+    const target = new Date(scheduledAt);
+    if (Number.isNaN(target.getTime()))
+      return { ok: false, note: "定时时间格式无效：" + scheduledAt };
+    const delta = target.getTime() - Date.now();
+    if (delta < 5 * 60_000)
+      return { ok: false, note: "B站要求至少 5 分钟后定时发布" };
+    if (delta > 15 * 24 * 3600_000)
+      return { ok: false, note: "B站要求 15 天以内定时发布" };
+    const text = this.formatScheduleTime(scheduledAt);
+    // 短信验证弹窗挡住时不做无效操作
+    const blocked = await wc
+      .executeJavaScript(
+        "!!document.querySelector('input.sms-cell')&&/请完成短信验证/.test(document.body?.innerText||'')",
+      )
+      .catch(() => false);
+    if (blocked)
+      return {
+        ok: false,
+        note: "B站触发短信验证（input.sms-cell），请先手动完成验证再重新发布",
+      };
+    if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+    // 1) 点定时开关（可能被风控遮挡，最多 10 轮）
+    let on = false;
+    for (let i = 0; i < 10 && !on; i++) {
+      const box = await wc
+        .executeJavaScript(
+          "(()=>{const el=document.querySelector('.time-container .switch-container');if(!el)return null;el.scrollIntoView({block:'center'});const r=el.getBoundingClientRect();return{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),on:!!el.querySelector('.switch-roll[class*=on]')||!!el.closest('.is-on')}})()",
+        )
+        .catch(() => null);
+      if (!box) { await sleep(1000); continue; }
+      if (box.on) { on = true; break; }
+      await wc.debugger.sendCommand("Input.dispatchMouseEvent", { type: "mouseMoved", x: box.x, y: box.y });
+      await wc.debugger.sendCommand("Input.dispatchMouseEvent", { type: "mousePressed", x: box.x, y: box.y, button: "left", buttons: 1, clickCount: 1 });
+      await sleep(120);
+      await wc.debugger.sendCommand("Input.dispatchMouseEvent", { type: "mouseReleased", x: box.x, y: box.y, button: "left", buttons: 0, clickCount: 1 });
+      await sleep(1000);
+      on = await wc
+        .executeJavaScript(
+          "(()=>{const el=document.querySelector('.time-container .switch-container');return !!(el&&(el.querySelector('.switch-roll[class*=on]')||el.closest('.is-on')||el.className.includes('active'))}||/定时发布时间|预约发布时间/.test(document.querySelector('.time-container')?.innerText||'')})()",
+        )
+        .catch(() => false);
+    }
+    if (!on)
+      return { ok: false, note: "未找到或无法打开 B站定时发布开关（可能被短信验证遮挡）" };
+    // 2) 找时间输入框（控件结构未完全取证：风控挡住探测），通用匹配
+    let found = false;
+    for (let i = 0; i < 20 && !found; i++) {
+      found = await wc
+        .executeJavaScript(
+          "(()=>{const t=document.querySelector('.time-container');if(!t)return false;const ins=[...t.querySelectorAll('input')].filter(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&e.type!=='checkbox'});const el=ins[0];if(!el)return false;el.focus();el.select?.();return document.activeElement===el})()",
+        )
+        .catch(() => false);
+      if (!found) await sleep(1000);
+    }
+    if (!found)
+      return { ok: false, note: "定时开关已打开但未找到时间输入框" };
+    // 3) 真实键盘输入 + 严格回读（同抖音/快手事故教训）
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2 });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2 });
+    await wc.debugger.sendCommand("Input.insertText", { text });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyDown", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+    await sleep(1500);
+    const got = await wc
+      .executeJavaScript(
+        "(()=>{const t=document.querySelector('.time-container');const el=[...(t?.querySelectorAll('input')||[])].find(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&e.type!=='checkbox'});return el?.value||''})()",
+      )
+      .catch(() => "");
+    await writeBrowserLog("bilibili-schedule-verify " + JSON.stringify({ want: text, got }));
+    if (got !== text)
+      return { ok: false, note: "定时时间未正确写入（目标 " + text + "，实际 " + got + "），已放弃" };
+    return { ok: true, note: "已设为定时发布 " + got + "（平台到点自动发布）" };
+  }
+  /**
+   * 头条定时发布（2026-11-24 取证）：页面明示"竖版视频…不支持…
+   * 定时等功能"，竖版无法定时；横版才有定时控件。控件 DOM 未完整
+   * 取证（探测时全是竖版草稿），这里通用搜索"定时发布"开关，找不到
+   * 就明确报错，绝不静默按立即发布。
+   */
+  private async setToutiaoSchedule(
+    wc: Electron.WebContents,
+    scheduledAt: string,
+  ): Promise<{ ok: boolean; note: string }> {
+    const target = new Date(scheduledAt);
+    if (Number.isNaN(target.getTime()))
+      return { ok: false, note: "定时时间格式无效：" + scheduledAt };
+    const body = await wc
+      .executeJavaScript("document.body?.innerText||''")
+      .catch(() => "");
+    if (/竖版视频[^\n]*不支持[^\n]*定时|不支持[^\n]*定时/.test(body))
+      return {
+        ok: false,
+        note: "当前视频为竖版（9:16），头条平台明示竖版不支持定时发布；请用横版视频或改为立即发布",
+      };
+    const text = this.formatScheduleTime(scheduledAt);
+    if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+    // 通用搜索"定时发布"开关（checkbox/switch）
+    let toggled = false;
+    for (let i = 0; i < 15 && !toggled; i++) {
+      toggled = await wc
+        .executeJavaScript(
+          "(()=>{const all=[...document.querySelectorAll('*')];const el=all.find(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&/^定时发布$/.test((e.textContent||'').trim())&&e.children.length<3});if(!el)return false;const cb=el.querySelector('input[type=checkbox],[role=switch]')||el.closest('label')?.querySelector('input[type=checkbox]');if(cb){if(cb.checked)return true;cb.click();return !!cb.checked}const sib=el.parentElement?.querySelector('[class*=switch]');if(sib){sib.click();return true}return false})()",
+        )
+        .catch(() => false);
+      if (!toggled) await sleep(1000);
+    }
+    if (!toggled)
+      return { ok: false, note: "未找到头条定时发布开关（横版视频才有此功能）" };
+    // 找时间输入 + 严格回读
+    let found = false;
+    for (let i = 0; i < 15 && !found; i++) {
+      found = await wc
+        .executeJavaScript(
+          "(()=>{const ins=[...document.querySelectorAll('input')].filter(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&e.type==='text'&&(/时间|日期/.test(e.getAttribute('placeholder')||'')||!!e.getAttribute('format'))});const el=ins[ins.length-1];if(!el)return false;el.focus();el.select?.();return document.activeElement===el})()",
+        )
+        .catch(() => false);
+      if (!found) await sleep(1000);
+    }
+    if (!found) return { ok: false, note: "定时开关已打开但未找到时间输入框" };
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2 });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2 });
+    await wc.debugger.sendCommand("Input.insertText", { text });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyDown", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+    await wc.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+    await sleep(1500);
+    const got = await wc
+      .executeJavaScript(
+        "(()=>{const ins=[...document.querySelectorAll('input')].filter(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&e.type==='text'&&(/时间|日期/.test(e.getAttribute('placeholder')||'')||!!e.getAttribute('format'))});return ins[ins.length-1]?.value||''})()",
+      )
+      .catch(() => "");
+    await writeBrowserLog("toutiao-schedule-verify " + JSON.stringify({ want: text, got }));
+    if (got !== text)
+      return { ok: false, note: "定时时间未正确写入（目标 " + text + "，实际 " + got + "），已放弃" };
+    return { ok: true, note: "已设为定时发布 " + got + "（平台到点自动发布）" };
+  }
+  /**
    * 自测专用：删除刚发布的测试作品（仅抖音）。
    *
    * 2026-11-13 事故驱动：11-11 两轮自测把"自测验证 MP20261111…"公开发布
@@ -6861,7 +7012,7 @@ export class BrowserManager {
         continue;
       }
       const state = await wc.executeJavaScript(
-        "(()=>{const text=(document.body?.innerText||'').slice(-12000);const success=/\u53d1\u5e03\u6210\u529f|\u6295\u7a3f\u6210\u529f|\u7a3f\u4ef6\u6295\u9012\u6210\u529f|\u53d1\u8868\u6210\u529f|\u4f5c\u54c1\u53d1\u5e03\u6210\u529f|\u63d0\u4ea4\u6210\u529f|\u5df2\u53d1\u5e03/.test(text);const visible=e=>!!e&&e.offsetParent!==null;const challengeTexts=[...document.querySelectorAll('div,span,p,h1,h2,h3,button')].filter(visible).map(e=>(e.textContent||'').trim()).filter(value=>value&&value.length<240&&/验证码|安全验证|扫码验证|手机验证/.test(value));const challengeText=challengeTexts.sort((a,b)=>a.length-b.length)[0]||'';const challenge=!!challengeText;const failed=/发布失败|投稿失败|上传失败|提交失败/.test(text);return{success,challenge,challengeText,failed,text:text.slice(-500)}})()",
+        "(()=>{const text=(document.body?.innerText||'').slice(-12000);const success=/\u53d1\u5e03\u6210\u529f|\u6295\u7a3f\u6210\u529f|\u7a3f\u4ef6\u6295\u9012\u6210\u529f|\u53d1\u8868\u6210\u529f|\u4f5c\u54c1\u53d1\u5e03\u6210\u529f|\u63d0\u4ea4\u6210\u529f|\u5df2\u53d1\u5e03/.test(text);const visible=e=>!!e&&e.offsetParent!==null;const challengeTexts=[...document.querySelectorAll('div,span,p,h1,h2,h3,button')].filter(visible).map(e=>(e.textContent||'').trim()).filter(value=>value&&value.length<240&&/验证码|安全验证|扫码验证|手机验证|短信验证|完成验证|请输入.*位.*验证码/.test(value));const challengeText=challengeTexts.sort((a,b)=>a.length-b.length)[0]||'';const smsChallenge=/请完成短信验证|短信验证码|获取验证码/.test(text)&&!!document.querySelector('input.sms-cell');const challenge=!!challengeText||smsChallenge;const failed=/发布失败|投稿失败|上传失败|提交失败/.test(text);return{success,challenge,challengeText:challengeText||(smsChallenge?'请完成短信验证':''),failed,text:text.slice(-500)}})()",
       );
       if (state.challenge) {
         challengeSeen = true;
@@ -6907,13 +7058,19 @@ export class BrowserManager {
         };
       await sleep(2000);
     }
+    const isSms =
+      /短信验证|短信验证码/.test(lastChallenge) ||
+      (platform === "bilibili" && challengeSeen);
     return {
       success: false,
       challenge: challengeSeen,
       message: challengeSeen
-        ? "平台安全验证未在等待时间内完成：" +
-          lastChallenge +
-          (challengeEvidence ? "；现场截图：" + challengeEvidence : "")
+        ? isSms
+          ? "B站触发短信验证（发文量大时的平台风控，属人工环节）：请在应用内打开发布页完成短信验证后，点该任务的『重新发布』。本次未发出，不会重复发布。" +
+            (challengeEvidence ? "；现场截图：" + challengeEvidence : "")
+          : "平台安全验证未在等待时间内完成：" +
+            lastChallenge +
+            (challengeEvidence ? "；现场截图：" + challengeEvidence : "")
         : "",
     };
   }
