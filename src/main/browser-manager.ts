@@ -2213,15 +2213,38 @@ export class BrowserManager {
         }>;
         const byId = new Map(nodes.map((node) => [node.nodeId, node]));
         const buttonIds = new Set<number>();
+        // 定时发布时按钮文本变成"定时发布"/"预约发布"，只匹配"发布"
+        // 会导致 buttonPoints=[] → mouse-fallback 盲点坐标、平台从未收到
+        // 提交（2026-11-24 用户批次实证）。扩展匹配集合。
+        const xhsSubmitTexts = scheduleSetOk
+          ? ["定时发布", "预约发布", "发布", "立即发布", "确认发布"]
+          : ["发布"];
         for (const textNode of nodes.filter(
           (node) =>
             node.nodeName === "#text" &&
-            (node.nodeValue || "").trim() === "发布",
+            xhsSubmitTexts.includes((node.nodeValue || "").trim()),
         )) {
           let current: typeof textNode | undefined = textNode;
-          while (current && current.nodeName !== "BUTTON" && current.parentId)
+          while (
+            current &&
+            !/^(BUTTON|DIV|SPAN|A)$/.test(current.nodeName) &&
+            current.parentId
+          )
             current = byId.get(current.parentId);
-          if (current?.nodeName === "BUTTON") buttonIds.add(current.nodeId);
+          // 定时开关本身也是"定时发布"文本，排除 switch/radio/label 容器
+          let excluded = false;
+          if (current) {
+            let p: typeof current | undefined = current;
+            for (let d = 0; d < 5 && p; d++) {
+              const cls = (p.attributes || []).join(" ");
+              if (/custom-switch|d-switch|ant-radio-wrapper|role=switch|<label/.test(cls)) {
+                excluded = true;
+                break;
+              }
+              p = p.parentId ? byId.get(p.parentId) : undefined;
+            }
+          }
+          if (current && !excluded) buttonIds.add(current.nodeId);
         }
         const buttonPoints: Array<{
           nodeId: number;
@@ -2697,20 +2720,37 @@ export class BrowserManager {
             );
         }
       } else {
-        clicked = await this.clickButtonByText(
-          wc,
-          [
-            "发布",
-            "立即发布",
-            "确认发布",
-            "投稿",
-            "立即投稿",
-            "提交发布",
-            "发表",
-          ],
-          true,
-          account.platform === "weixin",
-        );
+        // 定时发布时按钮文本会变成"定时发布"/"预约发布"等，而定时开关
+        // 本身也叫"定时发布"——普通 clickButtonByText 靠文本节点找，会
+        // 误点开关或找不到（2026-11-24 用户批次实证：小红书
+        // buttonPoints=[]、mouse-fallback 盲点坐标，平台从未收到提交）。
+        // 定时场景用专用方法：只认 button 且排除 switch/radio 容器。
+        if (scheduleSetOk) {
+          clicked = await this.clickScheduleSubmit(wc);
+          if (!clicked) {
+            // 专用方法没找到 → 退回普通候选（排除误点开关的风险由
+            // 上面的容器过滤承担，这里仍带上常规文本兜底）
+            clicked = await this.clickButtonByText(
+              wc,
+              ["发布", "立即发布", "确认发布", "投稿", "立即投稿", "提交发布", "发表"],
+              true,
+              false,
+            );
+          }
+          await writeBrowserLog(
+            "publish-button-click platform=" +
+              account.platform +
+              " scheduled=true clicked=" +
+              String(clicked),
+          );
+        } else {
+          clicked = await this.clickButtonByText(
+            wc,
+            ["发布", "立即发布", "确认发布", "投稿", "立即投稿", "提交发布", "发表"],
+            true,
+            account.platform === "weixin",
+          );
+        }
       }
       if (!clicked) throw new Error("没有找到可用的发布按钮");
       if (account.platform === "weixin") {
@@ -2804,14 +2844,18 @@ export class BrowserManager {
       // 即视为成功；消息明确告诉用户"由平台到点发布"。
       if (scheduleSetOk) {
         const url = wc.getURL();
-        const submitted =
-          result.success ||
-          /\/manage|\/note-manager/.test(url) ||
-          (await wc
-            .executeJavaScript(
-              "/定时发布成功|预约发布成功|发布成功|提交成功/.test(document.body?.innerText||'')",
-            )
-            .catch(() => false));
+        // 注意：**不能**把"跳到 /manage"算作提交证据 —— 那是
+        // verifyPublishedTitle 为了查列表**自己 navigate 过去的**
+        // （2026-11-24 用户批次实证：小红书跳 note-manager 但平台
+        // 从未收到发布请求）。只认 result.success 或明确的成功提示。
+        // 2026-11-24 事故：快手 result.success 因跳到 /manage 为 true，
+        // 但平台根本没有这条作品。定时场景**不认 URL 跳转**，只认页面
+        // 明确的成功提示；宁可报失败让用户重试，绝不虚报成功。
+        const submitted = await wc
+          .executeJavaScript(
+            "/定时发布成功|预约发布成功|作品已提交定时|已设定定时发布/.test(document.body?.innerText||'')",
+          )
+          .catch(() => false);
         await writeBrowserLog(
           "schedule-submit-check " +
             JSON.stringify({ platform: account.platform, submitted, url }),
@@ -3409,6 +3453,37 @@ export class BrowserManager {
       buttons: 0,
       clickCount: 1,
     });
+    return true;
+  }
+  /**
+   * 定时场景的提交按钮：定时开关本身文本也是"定时发布"，普通
+   * clickButtonByText 会误点开关（2026-11-24 用户批次实证）。
+   * 只认 button/role=button 且不在 switch/radio 容器内的可见元素，
+   * 用 CDP 可信鼠标点击，并回读点击后是否离开编辑页。
+   */
+  private async clickScheduleSubmit(
+    wc: Electron.WebContents,
+  ): Promise<boolean> {
+    const point = (await wc
+      .executeJavaScript(
+        "(()=>{const vis=e=>{const r=e.getBoundingClientRect();return r.width>8&&r.height>8&&getComputedStyle(e).visibility!=='hidden'};const bad=e=>!!e.closest('.custom-switch-wrapper,.ant-radio-wrapper,.d-switch,[role=switch],label');const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const c=all(document).filter(e=>vis(e)&&e.matches('button,[role=button]')&&!bad(e)&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&/^(定时发布|预约发布|发布|立即发布|确认发布|提交发布|投稿|立即投稿|发表)$/.test((e.textContent||'').trim()));c.sort((a,b)=>b.getBoundingClientRect().bottom-a.getBoundingClientRect().bottom);const e=c[0];if(!e)return null;e.scrollIntoView({block:'center'});const r=e.getBoundingClientRect();return{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),text:(e.textContent||'').trim(),tag:e.tagName}})()",
+      )
+      .catch(() => null)) as { x: number; y: number; text: string } | null;
+    if (!point) return false;
+    if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
+    await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+      type: "mouseMoved", x: point.x, y: point.y,
+    });
+    await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+      type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: 1,
+    });
+    await sleep(120);
+    await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+      type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: 1,
+    });
+    await writeBrowserLog(
+      "schedule-submit-click " + JSON.stringify(point),
+    );
     return true;
   }
   private async clickButtonByText(
