@@ -6328,18 +6328,39 @@ export class BrowserManager {
     }
     if (!switched)
       return { ok: false, note: "未找到快手「定时发布」单选控件" };
-    // 2) 等日期输入框可编辑 + JS focus（不依赖 backendNodeId）
+    // 2) antd DatePicker 的 input 初始是 readonly，**必须先真实点击**
+    //    才会解除 readonly 并激活输入（2026-11-24 实证：点击前 readonly
+    //    =true，点击后 readonly=false）。因此先找坐标 → CDP 鼠标点击 →
+    //    再 JS focus + select。
     let focused = false;
     for (let i = 0; i < 40 && !focused; i++) {
-      focused = await wc
+      const box = await wc
         .executeJavaScript(
-          "(()=>{const el=[...document.querySelectorAll('input')].find(e=>e.getAttribute('placeholder')==='选择日期时间');if(!el||el.hasAttribute('readonly'))return false;el.focus();el.select?.();return document.activeElement===el})()",
+          "(()=>{const el=[...document.querySelectorAll('input')].find(e=>e.getAttribute('placeholder')==='选择日期时间');if(!el)return null;el.scrollIntoView({block:'center'});const r=el.getBoundingClientRect();return{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)}})()",
         )
-        .catch(() => false);
+        .catch(() => null);
+      if (box) {
+        await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+          type: "mouseMoved", x: box.x, y: box.y,
+        });
+        await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+          type: "mousePressed", x: box.x, y: box.y, button: "left", buttons: 1, clickCount: 1,
+        });
+        await sleep(120);
+        await wc.debugger.sendCommand("Input.dispatchMouseEvent", {
+          type: "mouseReleased", x: box.x, y: box.y, button: "left", buttons: 0, clickCount: 1,
+        });
+        await sleep(500);
+        focused = await wc
+          .executeJavaScript(
+            "(()=>{const el=[...document.querySelectorAll('input')].find(e=>e.getAttribute('placeholder')==='选择日期时间');if(!el||el.hasAttribute('readonly'))return false;el.focus();el.select?.();return document.activeElement===el})()",
+          )
+          .catch(() => false);
+      }
       if (!focused) await sleep(1500);
     }
     if (!focused)
-      return { ok: false, note: "快手日期输入框始终只读或不存在（视频可能仍在上传）" };
+      return { ok: false, note: "快手日期输入框点击后仍未激活（视频可能仍在上传）" };
     // 3) CDP 真实键盘输入
     await wc.debugger.sendCommand("Input.dispatchKeyEvent", {
       type: "rawKeyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2,
