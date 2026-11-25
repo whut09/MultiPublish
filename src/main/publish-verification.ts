@@ -2,7 +2,17 @@ export function publishUploadTimeout(platform: string) {
   // 小红书 2026-11-05 用户批次实证：9MB 视频上传+转码耗时超过 3 分钟窗口，
   // 发布按钮在转码完成前持续禁用（页面已显示"重新上传"即文件已就位），
   // 与抖音/头条/视频号同为 10 分钟，避免大视频/慢转码被误判失败。
-  return ["douyin", "toutiao", "weixin", "xiaohongshu"].includes(platform)
+  // B站/快手 2026-11-25 Ling 批次实证：快手 SPA"应用加载失败"恢复后重传，
+  // 180 秒窗口在上传 55% 时到期误判失败；B 站 7MB 上传卡 0% 耗尽 3 分钟。
+  // 两平台一并放宽到 10 分钟。
+  return [
+    "douyin",
+    "toutiao",
+    "weixin",
+    "xiaohongshu",
+    "bilibili",
+    "kuaishou",
+  ].includes(platform)
     ? 600000
     : 180000;
 }

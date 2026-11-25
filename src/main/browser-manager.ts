@@ -1611,10 +1611,15 @@ export class BrowserManager {
                         "1"
                       )
                         throw new Error("自测：强制 chooser 失败以验证 drop 注入");
+                      // insideDialog: 只在封面弹窗容器内找可信点击目标。
+                      // 2026-11-25 Ling 批次实证：不限定时"上传封面"命中
+                      // 弹窗外的外层按钮（460,442），可信点击把刚打开的
+                      // 弹窗又关掉，chooser 永远不弹，封面链路全灭
                       await this.chooseFileFromButton(
                         wc,
                         ["点击上传", "上传图片", "上传封面", "选择图片", "本地上传"],
                         draft.coverPath,
+                        { insideDialog: true },
                       );
                       localCoverPreSet = true;
                       await writeBrowserLog(
@@ -3661,6 +3666,7 @@ export class BrowserManager {
     wc: Electron.WebContents,
     selector: string | string[],
     file: string,
+    options?: { insideDialog?: boolean },
   ) {
     if (!wc.debugger.isAttached()) wc.debugger.attach("1.3");
     const labels = Array.isArray(selector)
@@ -3700,8 +3706,10 @@ export class BrowserManager {
       // Input.dispatchMouseEvent 做可信点击。
       const point = (await wc
         .executeJavaScript(
-          "((labels)=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};for(const label of labels){const c=all(document).filter(e=>visible(e)&&(e.textContent||'').trim()===label&&e.children.length<5);c.sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return ar.width*ar.height-br.width*br.height});const t=c[0];if(!t)continue;t.scrollIntoView({block:'center'});const r=t.getBoundingClientRect();return{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),label}}return null})(" +
+          "((labels,insideDialog)=>{const visible=e=>!!e&&e.getClientRects?.().length>0&&getComputedStyle(e).visibility!=='hidden';const all=root=>{const r=[];for(const e of root.querySelectorAll('*')){r.push(e);if(e.shadowRoot)r.push(...all(e.shadowRoot))}return r};const inDialog=e=>{for(let p=e.parentElement;p;p=p.parentElement){const c=String(p.className||'')+' '+(p.id||'');if(/modal|Modal|dialog|Dialog|popup|Popup/.test(c)||p.getAttribute?.('role')==='dialog')return true}return false};for(const label of labels){const c=all(document).filter(e=>visible(e)&&(e.textContent||'').trim()===label&&e.children.length<5&&(!insideDialog||inDialog(e)));c.sort((a,b)=>{const ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();return ar.width*ar.height-br.width*br.height});const t=c[0];if(!t)continue;t.scrollIntoView({block:'center'});const r=t.getBoundingClientRect();return{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),label}}return null})(" +
             JSON.stringify(labels) +
+            "," +
+            String(options?.insideDialog === true) +
             ")",
         )
         .catch(() => null)) as {
@@ -5641,7 +5649,12 @@ export class BrowserManager {
       // Bilibili keeps a static “上传进度” label in the editor after the
       // upload is complete. The actionable submit control is the reliable
       // readiness signal, so do not gate on that stale label.
-      if (state.publish && state.title) return true;
+      // 但"上传中…/当前速度/剩余时间"是上传进行中的真实信号：2026-11-25
+      // Ling 批次实证——上传 0%（0.0MB/s）时"立即投稿"按钮+标题已就绪
+      // 即放行，随后 setBilibiliSchedule 找不到定时开关（尚未渲染）导致
+      // 整个任务失败。上传进行中必须继续等。
+      const uploadOngoing = /上传中|当前速度|剩余时间/.test(state.text);
+      if (state.publish && state.title && !uploadOngoing) return true;
       await sleep(1500);
     }
     return false;
@@ -5655,6 +5668,14 @@ export class BrowserManager {
     let lastDiagnosticAt = 0;
     // 抖音"仍在解析"状态的起始时刻：用于 180 秒宽限（文案残留时不卡死）
     let douyinBusySince = 0;
+    // 抖音"无 video 元素"宽限的起始时刻：必须放在 while 循环外。此前
+    // 声明在循环内的 douyin 分支里，每轮都被重置为 0，90 秒宽限永远
+    // 不到期（2026-11-25 Ling 批次实证：上传失败后页面无 video 元素，
+    // 宽限失效导致死等 600 秒才超时）
+    let douyinNoVideoSince = 0;
+    // 抖音"上传失败"持续计时：上传失败文案可能在上传重试期间一闪而过，
+    // 持续 15 秒仍在才判定真失败，避免误杀正在自动重试的上传
+    let douyinFailSince = 0;
     while (Date.now() - start < timeout) {
       if (wc.isDestroyed()) throw new Error("发布窗口已关闭");
       const uploadFailure = this.weixinUploadFailures.get(wc.id);
@@ -5848,8 +5869,21 @@ export class BrowserManager {
       //     持续 >90 秒 → 放行（抖音可能用非 <video> 渲染预览，
       //     此时若死等 videoReady 会一路卡到 600 秒超时）。
       if (platform === "douyin") {
+        // 上传真失败（页面出现"上传失败"且无"上传成功"）持续 15 秒：
+        // 快速失败并明确告知原因，不再死等整个超时窗口。2026-11-25
+        // Ling 批次实证：分片重传失败后页面停在"上传失败，重新上传"，
+        // 旧逻辑不识别失败态，白等 600 秒才报"等待视频上传完成超时"，
+        // 真实原因被掩盖
+        if (state.failed && !state.videoReady) {
+          if (!douyinFailSince) douyinFailSince = Date.now();
+          if (Date.now() - douyinFailSince >= 15000)
+            throw new Error(
+              "抖音视频上传失败（页面显示「上传失败，重新上传」），多为网络波动或平台限流；请稍后点重新发布重试",
+            );
+        } else {
+          douyinFailSince = 0;
+        }
         let busyGraceOver = false;
-        let noVideoSince = 0;
         if (state.douyinBusy && state.videoReady) {
           if (!douyinBusySince) douyinBusySince = Date.now();
           if (Date.now() - douyinBusySince < 180000) {
@@ -5866,18 +5900,18 @@ export class BrowserManager {
           douyinBusySince = 0;
         }
         if (!state.videoReady) {
-          if (!noVideoSince) noVideoSince = Date.now();
+          if (!douyinNoVideoSince) douyinNoVideoSince = Date.now();
         } else {
-          noVideoSince = 0;
+          douyinNoVideoSince = 0;
         }
         const noVideoGraceOver =
           !state.videoReady &&
           !state.douyinBusy &&
-          Date.now() - noVideoSince >= 90000;
+          Date.now() - douyinNoVideoSince >= 90000;
         if (noVideoGraceOver)
           await writeBrowserLog(
             "douyin-publish-ready-no-video-grace-expired elapsed=" +
-              String(Date.now() - noVideoSince),
+              String(Date.now() - douyinNoVideoSince),
           );
         if (
           state.publish &&
