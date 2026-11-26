@@ -812,6 +812,9 @@ export class BrowserManager {
           // 太急，故障未恢复就放弃 —— 放宽到 6 轮、间隔 20 秒。
           let reloaded = 0;
           let lastReloadAt = 0;
+          // 连续空白轮数：必须放在循环外计数（放循环内=每轮重置=判定
+          // 永不生效，与 douyinNoVideoSince 同款作用域陷阱）
+          let blankRounds = 0;
           for (let wait = 0; wait < 75; wait += 2) {
             await sleep(2000);
             const retryInputs = await this.waitForFileInputs(wc, 1000);
@@ -825,7 +828,23 @@ export class BrowserManager {
               )
               .catch(() => false);
             if (broken) spaBrokenSeen = true;
-            if (broken && reloaded < 6 && Date.now() - lastReloadAt > 20000) {
+            // 空白页也算加载失败：2026-11-26 08:26 批实证——抖音
+            // content/upload 页重试时 body 完全空白（innerText 空、
+            // 0 inputs、readyState complete）持续 2.5 分钟，旧逻辑
+            // 只认"应用加载失败"文案，空白页不重载，干等到超时报
+            // 「上传按钮不存在」。SPA 渲染静默失败时页面就是空的。
+            // 连续 10 轮（约 20 秒）空白才判定，避免误杀正常渲染中。
+            const blank = await wc
+              .executeJavaScript(
+                "document.readyState==='complete'&&(document.body?.innerText||'').trim().length<5",
+              )
+              .catch(() => false);
+            if (blank) blankRounds += 1;
+            else blankRounds = 0;
+            if ((broken || blankRounds >= 10) &&
+              reloaded < 6 &&
+              Date.now() - lastReloadAt > 20000
+            ) {
               reloaded += 1;
               spaBrokenRounds = reloaded;
               lastReloadAt = Date.now();
@@ -2522,6 +2541,14 @@ export class BrowserManager {
         await writeBrowserLog(
           "douyin-post-click-toasts " + JSON.stringify(douyinToasts),
         );
+        // 平台在点击后弹「上传失败，重新上传」toast：说明上传通道根本
+        // 没成功（2026-11-26 08:26 批实证：0 个分片 POST，点击发布后
+        // toast 连发 5 条「xxx.mp4上传失败，重新上传」），此时必须立即
+        // 报真实原因，不能再走下去让验真环节报一个含糊的失败
+        if (douyinToasts.some((t) => /上传失败/.test(t)))
+          throw new Error(
+            "抖音视频上传失败（平台提示「上传失败，重新上传」），上传通道未成功，多为网络波动；请检查网络后点重新发布重试",
+          );
       } else if (account.platform === "bilibili") {
         await sleep(15000);
         clickDiagnostics = await wc
